@@ -1,12 +1,14 @@
 {
 	"dependencies": [
+		{ "name": "lime", "type": "haxelib", "version": "8.2.2" },
+		{ "name": "openfl", "type": "haxelib", "version": "9.2.2" },
 		{ "name": "flixel", "type": "haxelib", "version": "5.8.0" },
 		{ "name": "flixel-addons", "type": "haxelib", "version": "3.2.3" },
-		{ "name": "flixel-ui", "type": "haxelib", "version": "2.6.1" },
+		{ "name": "flixel-ui", "type": "haxelib", "version": "2.6.4" },
 		{ "name": "hscript", "type": "haxelib", "version": "2.6.0" },
-		{ "name": "hxjsonast", "type": "haxelib", "version": "" },
+		{ "name": "hxjsonast", "type": "haxelib", "version": "1.1.0" },
 		{ "name": "json2object", "type": "haxelib", "version": "3.11.0" },
-		{ "name": "hxcpp", "type": "haxelib", "version": "" },
-		{ "name": "hxvlc", "type": "haxelib", "version": "" }
+		{ "name": "hxcpp", "type": "haxelib", "version": "4.3.2" },
+		{ "name": "hxvlc", "type": "haxelib", "version": "1.9.1" }
 	]
 }

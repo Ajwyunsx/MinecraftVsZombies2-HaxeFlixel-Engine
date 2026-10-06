@@ -11,8 +11,8 @@
 | 组件 | 说明 |
 |---|---|
 | Haxe 4.3+ | 编译到 hxcpp（Windows 桌面）、neko（类型检查）、html5 / mobile 目标 |
-| HaxeFlixel | flixel 5.8.0 / flixel-addons 3.2.3 / flixel-ui 2.6.1（`hmm.json` 锁定版本） |
-| OpenFL / Lime | 渲染与窗口层；桌面目标带 `hxvlc` 视频 |
+| HaxeFlixel | flixel 5.8.0 / flixel-addons 3.2.3 / flixel-ui 2.6.4（`hmm.json` 锁定版本） |
+| OpenFL / Lime | lime 8.2.2 + openfl 9.2.2（版本组合与本项目编译验证一致）；桌面目标带 `hxvlc` 1.9.1 视频 |
 | unity 兼容层 | `source/unity/` 下的 UnityEngine shim：`Vector3`、`Coroutine`、`MonoBehaviour`、`Animator` 等 |
 | 表达式引擎 | `source/expressionevaluator/`（原版 ExpressionEvaluator 的逐文件移植） |
 | 序列化 | newtonsoft（JSON）、nbtutility（Minecraft NBT）、mukioi18n（i18n）、tmpro（TextMeshPro）、ngettext、system（.NET BCL 风格工具） |
@@ -43,10 +43,10 @@ HaxePort/
 
 ## 构建与运行
 
-前置：Haxe 4.3+、haxelib、hmm（依赖安装）、MSVC（hxcpp 桌面目标）。
+前置：**Haxe 4.3.x**（4.3.7 验证过，`Project.xml` 要求 ≥ 4.3.0）、haxelib、hmm（依赖安装）、MSVC（hxcpp 桌面目标）。
 
 ```bash
-# 安装 hmm.json 锁定的依赖
+# 安装 hmm.json 锁定的完整依赖闭包（引擎 + flixel 全家桶 + hxcpp/hxvlc）
 haxelib --global install hmm && hmm install
 
 # 构建 Windows 桌面版
@@ -56,8 +56,11 @@ haxelib run lime build windows
 cd export/windows/bin && ./MVZ2.exe
 ```
 
-调试说明：
+依赖版本在 `hmm.json` 中全部锁定（haxelib 不会自动拉传递依赖，必须列全：lime 8.2.2、openfl 9.2.2、flixel 5.8.0、flixel-addons 3.2.3、flixel-ui 2.6.4、hscript 2.6.0、hxjsonast 1.1.0、json2object 3.11.0、hxcpp 4.3.2、hxvlc 1.9.1）。
 
+注意事项：
+
+- **hxvlc 运行时需要 64 位 VLC media player**（libvlc.dll）；不想装 VLC 可以用 `haxelib run lime build windows -D disable-hxvlc` 跳过视频相关代码（`Project.xml` 已内置该开关）。
 - 启动阶段输出写在**运行目录**的 `boot-trace.log`（lime 的 Windows GUI 子系统会丢弃 stdout，这是唯一可见的启动日志，最后一行即卡点）。
 - 空引用排查用 `haxelib run lime build windows -debug`：hxcpp 启用空指针检查，异常可被捕获并降级到 `ErrorState` 显示调用栈。
 - 本机 lime 需为定制分支（`-D lime_use_old_deltatime`，见 `Project.xml` 注释）。
