@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="utf-8"?>
+<project>
+	<!-- PORT-NOTE: 「鼠标/键盘输入」工作包的隔离验证工程，只用于 tools_build/check_input.sh --window。
+	     define 段与 HaxePort/Project.xml 逐行一致（因此这里是真实的 lime release/debug define 集，
+	     也用于给 cpp 类型检查取真实 define），差别只有：
+	       · <source> 换成 ../../source + ../../verify（不复制 943MB 的 assets、不引用图标）
+	       · 应用入口换成 inputsmoke.InputSmokeMain（一个最小 FlxGame，首帧跑输入断言后 Sys.exit）
+	       · 窗口尺寸 320x240（不影响 define）
+	     不要把它当成游戏工程使用。 -->
+
+	<app title="MVZ2 Input Smoke" file="InputSmoke" main="inputsmoke.InputSmokeMain" package="mvz2.inputsmoke" version="0.0.1" company="Cuerzor" />
+
+	<app preloader="flixel.system.FlxBasePreloader" />
+
+	<meta name="minimum-haxe-version" content="4.3.0" />
+
+	<!-- ____________________________ Window Settings ___________________________ -->
+
+	<window width="320" height="240" fps="60" background="#000000" hardware="true" vsync="false" />
+
+	<window if="html5" resizable="true" />
+
+	<window if="desktop" resizable="true" maximized="false" />
+
+	<window if="mobile" orientation="landscape" fullscreen="true" width="0" height="0" />
+
+	<!-- _____________________________ Path Settings ____________________________ -->
+
+	<set name="BUILD_DIR" value="export" />
+	<!-- PORT-NOTE: 必须排在 ../../source 之后；Haxe 后出现的 -cp 对重复模块优先（本工程不需要覆盖层）。 -->
+	<source path="../../source" />
+	<source path="../../verify" />
+
+	<!-- _______________________________ Libraries ______________________________ -->
+
+	<haxelib name="flixel" />
+	<haxelib name="flixel-addons" />
+	<haxelib name="flixel-ui" />
+	<haxelib name="hscript" />
+	<haxelib name="hxjsonast" />
+	<haxelib name="json2object" />
+	<haxelib name="hxcpp" if="desktop" />
+	<haxelib name="hxvlc" if="desktop" unless="disable-hxvlc" />
+
+	<!-- _______________________________ Defines ________________________________ -->
+	<!-- 以下与 HaxePort/Project.xml 的 Defines 段保持一致。 -->
+
+	<!--Disable the Flixel core debugger-->
+	<define name="FLX_NO_DEBUG" if="release" />
+
+	<!--Optimise inputs, be careful you will get null errors if you don't use conditionals in your game-->
+	<!--原工程在多处使用鼠标右键/中键（Assets/Scripts/MVZ2/Map/MapController.cs 的地图右键拖动、
+	    MVZ2/Managers/InputManager.cs 的 0..2 三键轮询、Logic/Inputs/InputHelper.cs），
+	    因此不能启用 FLX_NO_MOUSE_ADVANCED——否则 release 构建下右键/中键会静默失效，
+	    与原版行为不符。对应移植代码用 #if FLX_MOUSE_ADVANCED 兼容该差异。-->
+	<define name="FLX_NO_TOUCH" if="desktop" />
+	<define name="FLX_NO_KEYBOARD" if="mobile" />
+	<define name="FLX_NO_GAMEPAD" if="mobile" />
+
+	<!--Disable the Flixel core sound tray-->
+	<define name="FLX_NO_SOUND_TRAY" />
+
+	<!--Disable the Flixel sound tray when in focus lost screen-->
+	<define name="FLX_NO_FOCUS_LOST_SCREEN" />
+
+	<!--Whether the game uses dictionary ini files for localization-->
+	<define name="MVZ2_LOCALIZATION" />
+
+	<!--本机 lime 为定制分支（Application.onUpdate 使用 Float 时间戳），openfl 9.3.4 期望 Int；
+	    该定义让 lime 回退到 Int 签名，否则会在 openfl 库源码处编译失败。-->
+	<define name="lime_use_old_deltatime" />
+
+	<!--Whether the game has a debug console-->
+	<define name="MVZ2_DEBUG_CONSOLE" unless="release" />
+
+	<!-- ________________________________ Custom ________________________________ -->
+</project>

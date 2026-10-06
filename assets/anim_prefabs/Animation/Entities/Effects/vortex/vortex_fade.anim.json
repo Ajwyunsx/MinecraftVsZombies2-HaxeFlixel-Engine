@@ -1,0 +1,1 @@
+{"kind":"clip","name":"vortex_fade","length":1.0,"sampleRate":60.0,"wrapMode":0,"legacy":0,"curves":[{"path":"Root/Center/Main/Vortex","classID":212,"attribute":"m_Color.a","script":null,"keys":[[0.0,0.0],[0.25,1.0],[0.75,1.0],[1.0,0.0]]}],"events":[]}

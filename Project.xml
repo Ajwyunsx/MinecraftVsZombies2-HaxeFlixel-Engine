@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="utf-8"?>
+<project>
+	<!-- _________________________ Application Settings _________________________ -->
+
+	<app title="Minecraft VS Zombies 2" file="MVZ2" main="Main" package="com.cuerzor58.mvz2" version="0.4.5" company="Cuerzor" />
+
+	<!--The flixel preloader is not accurate in Chrome. You can use it regularly if you embed the swf into a html file
+		or you can set the actual size of your file manually at "FlxPreloaderBase-onUpdate-bytesTotal"-->
+	<app preloader="flixel.system.FlxBasePreloader" />
+
+	<!--Minimum without FLX_NO_GAMEPAD: 11.8, without FLX_NO_NATIVE_CURSOR: 11.2-->
+	<meta name="minimum-haxe-version" content="4.3.0" />
+
+	<!-- ____________________________ Window Settings ___________________________ -->
+
+	<!--These window settings apply to all targets-->
+	<window width="1280" height="720" fps="60" background="#000000" hardware="true" vsync="false" />
+
+	<!--HTML5-specific-->
+	<window if="html5" resizable="true" />
+
+	<!--Desktop-specific-->
+	<window if="desktop" resizable="true" maximized="false" />
+
+	<!--Mobile-specific-->
+	<window if="mobile" orientation="landscape" fullscreen="true" width="0" height="0" />
+
+	<!-- _____________________________ Path Settings ____________________________ -->
+
+	<set name="BUILD_DIR" value="export" />
+	<source path="source" />
+	<assets path="assets" />
+	<assets path="art" exclude="*.flash" if="web" />
+	<icon path="art/icon16.png" size="16" />
+	<icon path="art/icon32.png" size="32" />
+	<icon path="art/icon64.png" size="64" />
+	<icon path="art/iconOG.png" size="256" />
+
+	<!-- _______________________________ Libraries ______________________________ -->
+
+	<haxelib name="flixel" />
+	<haxelib name="flixel-addons" />
+	<haxelib name="flixel-ui" />
+	<haxelib name="hscript" />
+	<haxelib name="hxjsonast" />
+	<haxelib name="json2object" />
+	<haxelib name="hxcpp" if="desktop" />
+	<haxelib name="hxvlc" if="desktop" unless="disable-hxvlc" />
+
+	<!-- _______________________________ Defines ________________________________ -->
+
+	<!--Disable the Flixel core debugger-->
+	<define name="FLX_NO_DEBUG" if="release" />
+
+	<!--Optimise inputs, be careful you will get null errors if you don't use conditionals in your game-->
+	<!--原工程在多处使用鼠标右键/中键（Assets/Scripts/MVZ2/Map/MapController.cs 的地图右键拖动、
+	    MVZ2/Managers/InputManager.cs 的 0..2 三键轮询、Logic/Inputs/InputHelper.cs），
+	    因此不能启用 FLX_NO_MOUSE_ADVANCED——否则 release 构建下右键/中键会静默失效，
+	    与原版行为不符。对应移植代码用 #if FLX_MOUSE_ADVANCED 兼容该差异。-->
+	<define name="FLX_NO_TOUCH" if="desktop" />
+	<define name="FLX_NO_KEYBOARD" if="mobile" />
+	<define name="FLX_NO_GAMEPAD" if="mobile" />
+
+	<!--Disable the Flixel core sound tray-->
+	<define name="FLX_NO_SOUND_TRAY" />
+
+	<!--Disable the Flixel sound tray when in focus lost screen-->
+	<define name="FLX_NO_FOCUS_LOST_SCREEN" />
+
+	<!--Whether the game uses dictionary ini files for localization-->
+	<define name="MVZ2_LOCALIZATION" />
+
+	<!--本机 lime 为定制分支（Application.onUpdate 使用 Float 时间戳），openfl 9.3.4 期望 Int；
+	    该定义让 lime 回退到 Int 签名，否则会在 openfl 库源码处编译失败。-->
+	<define name="lime_use_old_deltatime" />
+
+	<!--Whether the game has a debug console-->
+	<define name="MVZ2_DEBUG_CONSOLE" unless="release" />
+
+	<!-- ________________________________ Custom ________________________________ -->
+
+	<!--Place custom nodes like icons here (higher priority to override the HaxeFlixel icon)-->
+</project>

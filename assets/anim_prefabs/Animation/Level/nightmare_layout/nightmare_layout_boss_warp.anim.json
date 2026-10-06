@@ -1,0 +1,1 @@
+{"kind":"clip","name":"nightmare_layout_boss_warp","length":1.0,"sampleRate":60.0,"wrapMode":0,"legacy":0,"curves":[{"path":"Sky/BossSky","classID":114,"attribute":"warpTime","script":"a21d21cd4637ef04391d6b777dacd0dd","keys":[[0.0,0.0],[1.0,1.0]]}],"events":[]}

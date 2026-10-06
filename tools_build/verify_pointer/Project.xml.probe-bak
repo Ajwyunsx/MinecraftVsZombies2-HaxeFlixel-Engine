@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+	工作包 F 的 HXCPP_CHECK_POINTER 验证工程（临时覆盖层，不修改仓库根目录的 HaxePort/Project.xml）。
+
+	与 HaxePort/Project.xml 的唯一差异：
+	  * source / icon 路径改成相对本文件的 ../../source、../../art
+	  * 不含 <assets path="assets" />：assets 有 943MB，lime 每次构建都会复制一遍。
+	    运行期在 export/windows/bin 下建 assets 目录联接（junction）指回 HaxePort/assets。
+
+	用法（本目录下）：
+	    haxelib run lime build windows -debug -DHXCPP_CHECK_POINTER
+	- debug 让 MVZ2_DEBUG_CONSOLE / 断言打开，配合 HXCPP_CHECK_POINTER 使空引用变成可捕获异常。
+-->
+<project>
+	<!-- _________________________ Application Settings _________________________ -->
+
+	<app title="Minecraft VS Zombies 2" file="MVZ2" main="Main" package="com.cuerzor58.mvz2" version="0.4.5" company="Cuerzor" />
+
+	<app preloader="flixel.system.FlxBasePreloader" />
+
+	<meta name="minimum-haxe-version" content="4.3.0" />
+
+	<!-- ____________________________ Window Settings ___________________________ -->
+
+	<window width="1280" height="720" fps="60" background="#000000" hardware="true" vsync="false" />
+
+	<window if="html5" resizable="true" />
+	<window if="desktop" resizable="true" maximized="false" />
+	<window if="mobile" orientation="landscape" fullscreen="true" width="0" height="0" />
+
+	<!-- _____________________________ Path Settings ____________________________ -->
+
+	<set name="BUILD_DIR" value="export" />
+	<source path="../../source" />
+	<icon path="../../art/icon16.png" size="16" />
+	<icon path="../../art/icon32.png" size="32" />
+	<icon path="../../art/icon64.png" size="64" />
+	<icon path="../../art/iconOG.png" size="256" />
+
+	<!-- _______________________________ Libraries ______________________________ -->
+
+	<haxelib name="flixel" />
+	<haxelib name="flixel-addons" />
+	<haxelib name="flixel-ui" />
+	<haxelib name="hscript" />
+	<haxelib name="hxjsonast" />
+	<haxelib name="json2object" />
+	<haxelib name="hxcpp" if="desktop" />
+	<haxelib name="hxvlc" if="desktop" unless="disable-hxvlc" />
+
+	<!-- _______________________________ Defines ________________________________ -->
+
+	<define name="FLX_NO_DEBUG" if="release" />
+	<define name="FLX_NO_MOUSE_ADVANCED" if="release" />
+	<define name="FLX_NO_TOUCH" if="desktop" />
+	<define name="FLX_NO_KEYBOARD" if="mobile" />
+	<define name="FLX_NO_GAMEPAD" if="mobile" />
+
+	<define name="FLX_NO_SOUND_TRAY" />
+	<define name="FLX_NO_FOCUS_LOST_SCREEN" />
+
+	<define name="MVZ2_LOCALIZATION" />
+
+	<define name="lime_use_old_deltatime" />
+
+	<define name="MVZ2_DEBUG_CONSOLE" unless="release" />
+</project>

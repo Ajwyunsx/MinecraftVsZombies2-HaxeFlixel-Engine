@@ -1,0 +1,12 @@
+{
+	"dependencies": [
+		{ "name": "flixel", "type": "haxelib", "version": "5.8.0" },
+		{ "name": "flixel-addons", "type": "haxelib", "version": "3.2.3" },
+		{ "name": "flixel-ui", "type": "haxelib", "version": "2.6.1" },
+		{ "name": "hscript", "type": "haxelib", "version": "2.6.0" },
+		{ "name": "hxjsonast", "type": "haxelib", "version": "" },
+		{ "name": "json2object", "type": "haxelib", "version": "3.11.0" },
+		{ "name": "hxcpp", "type": "haxelib", "version": "" },
+		{ "name": "hxvlc", "type": "haxelib", "version": "" }
+	]
+}

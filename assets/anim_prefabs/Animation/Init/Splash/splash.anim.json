@@ -1,0 +1,1 @@
+{"kind":"clip","name":"splash","length":2.5,"sampleRate":60.0,"wrapMode":0,"legacy":0,"curves":[{"path":"Canvas/Creator","classID":114,"attribute":"m_fontColor.a","script":"f4688fdb7df04437aeb418b961361dc5","keys":[[0.0,0.0],[0.33333334,1.0],[1.6666666,1.0],[2.0,0.0],[2.5,0.0]]}],"events":[{"time":2.5,"functionName":"EnterTitleScreen","data":"","floatParam":0.0,"intParam":0}]}

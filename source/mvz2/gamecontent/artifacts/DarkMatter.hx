@@ -1,0 +1,58 @@
+// Ported from: Assets/Scripts/Vanilla/GameContent/Artifacts/Chapter2/DarkMatter.cs
+package mvz2.gamecontent.artifacts;
+
+import mvz2.gamecontent.artifacts.VanillaArtifactID.VanillaArtifactNames;
+import mvz2.gamecontent.buffs.VanillaBuffID;
+import mvz2logic.artifacts.Artifact;
+import mvz2logic.artifacts.ArtifactDefinition;
+import pvzengine.auras.AuraEffect;
+import pvzengine.auras.AuraEffectDefinition;
+import pvzengine.buffs.IBuffTarget;
+import pvzengine.callbacks.CallbackResult;
+import pvzengine.callbacks.EntityCallbackParams;
+import pvzengine.callbacks.LevelCallbacks;
+import pvzengine.entities.EntityTypes;
+using mvz2logic.artifacts.LogicArtifactProps;
+using mvz2logic.entities.LogicEnemyProps;
+using mvz2logic.entities.LogicEntityExt;
+using mvz2logic.level.LogicLevelExt;
+
+@:autoArtifactDefinition(VanillaArtifactNames.darkMatter)
+class DarkMatter extends ArtifactDefinition
+{
+    public function new(nsp:String, name:String)
+    {
+        super(nsp, name);
+        AddAura(new ProductionAura());
+        AddTrigger(LevelCallbacks.POST_ENTITY_INIT, PostEnemyInitCallback, 0, EntityTypes.ENEMY);
+    }
+    public override function PostUpdate(artifact:Artifact):Void
+    {
+        super.PostUpdate(artifact);
+        artifact.SetGlowing(true);
+    }
+    function PostEnemyInitCallback(param:EntityCallbackParams, result:CallbackResult):Void
+    {
+        var entity = param.entity;
+        if (!entity.Level.HasArtifact(GetID()))
+            return;
+        if (entity.IsPreviewEnemy())
+            return;
+        entity.AddBuff(VanillaBuffID.Enemy.darkMatterInvisible);
+    }
+}
+
+// PORT-NOTE: C# 嵌套类 DarkMatter.ProductionAura → Haxe 模块子类型，访问路径一致。
+class ProductionAura extends AuraEffectDefinition
+{
+    public function new()
+    {
+        super(VanillaBuffID.Contraption.darkMatterProduction);
+    }
+    public override function GetAuraTargets(auraEffect:AuraEffect, results:Array<IBuffTarget>):Void
+    {
+        var level = auraEffect.Source.GetLevel();
+        for (target in level.FindEntities(e -> e.Type == EntityTypes.PLANT && e.IsFriendlyEntity()))
+            results.push(target);
+    }
+}

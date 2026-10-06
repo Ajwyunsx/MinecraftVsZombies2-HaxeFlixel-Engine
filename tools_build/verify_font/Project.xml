@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+	字体工作包的隔离自检工程（不修改仓库根目录的 HaxePort/Project.xml、不占用 HaxePort/export）。
+
+	与 HaxePort/Project.xml 的差异：
+	  * source 只挂 ../../source（供将来引用 mvz2 字体加载器），本工程实际编译的入口是
+	    FontProbe.hx（`main="fontcheck.FontProbe"`），因此只有被它引用的模块会被编译 ——
+	    秒级构建，不碰 943MB 资源、不与共享 export/windows 竞争。
+	  * assets 只挂 ../../assets/Fonts（字体资产，约 40MB），用目录联接指回 HaxePort/assets 时
+	    不重复拷贝。
+	  * 其余 defines 与主工程一致（尤其 lime_use_old_deltatime 与 FlxDefines.run()）。
+
+	用法（本目录下）：
+	    haxelib run lime build windows -debug
+	    ./export/windows/bin/MVZ2.exe      # 结果看 ./export/windows/bin/font-probe.log
+-->
+<project>
+	<app title="MVZ2 Font Probe" file="FontProbe" main="fontcheck.FontProbe" package="com.cuerzor58.mvz2.fontprobe" version="0.0.1" company="Cuerzor" />
+
+	<window width="1280" height="720" fps="60" background="#000000" hardware="true" vsync="false" />
+	<window if="desktop" resizable="true" maximized="false" />
+
+	<set name="BUILD_DIR" value="export" />
+	<source path="." />
+	<source path="../../source" />
+	<!-- PORT-NOTE: 只挂字体相关的 15MB（otf + 导出的图集 PNG），不挂 943MB 的完整 assets：
+	     本探针测的是「字体资产 -> 字形像素」这一段，构建必须秒级、不与共享 export 竞争。
+	     副本由 setup.sh 建立。 -->
+	<assets path="assets" />
+
+	<haxelib name="flixel" />
+	<haxelib name="flixel-addons" />
+	<haxelib name="flixel-ui" />
+	<haxelib name="hscript" />
+	<haxelib name="hxjsonast" />
+	<haxelib name="json2object" />
+	<haxelib name="hxcpp" if="desktop" />
+	<haxelib name="hxvlc" if="desktop" unless="disable-hxvlc" />
+
+	<define name="FLX_NO_DEBUG" if="release" />
+	<define name="FLX_NO_TOUCH" if="desktop" />
+	<define name="FLX_NO_SOUND_TRAY" />
+	<define name="FLX_NO_FOCUS_LOST_SCREEN" />
+	<define name="lime_use_old_deltatime" />
+</project>

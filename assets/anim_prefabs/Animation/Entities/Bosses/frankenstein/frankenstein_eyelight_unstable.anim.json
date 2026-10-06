@@ -1,0 +1,1 @@
+{"kind":"clip","name":"frankenstein_eyelight_unstable","length":0.23333333,"sampleRate":60.0,"wrapMode":0,"legacy":0,"curves":[{"path":"Root/Center/Main/Body/Head/EyeLight","classID":1,"attribute":"m_IsActive","script":null,"keys":[[0.0,0.0],[0.16666667,1.0],[0.23333333,0.0]]}],"events":[]}

@@ -1,0 +1,1663 @@
+// Ported from: (新增文件) uGUI（UnityEngine.UI / TMPro）→ Flixel 显示列表的渲染桥
+package mvz2.ui;
+
+import flixel.FlxSprite;
+import flixel.FlxG;
+import flixel.group.FlxGroup;
+import flixel.text.FlxText;
+import flixel.util.FlxColor;
+import mvz2.sprites.SpriteFrameFactory;
+import mvz2.sprites.SpriteManifestData;
+import mvz2.sprites.SpriteManifestLoader;
+import unity.Canvas;
+import unity.CanvasGroup;
+import unity.Collider2D;
+import unity.Component;
+import unity.BoxCollider2D;
+import unity.CapsuleCollider2D;
+import unity.CircleCollider2D;
+import unity.GameObject;
+import unity.PolygonCollider2D;
+import unity.RectTransform;
+import unity.SortingLayer;
+import unity.SpriteRenderer;
+import unity.Transform;
+import unity.Vector2;
+import unity.Vector3;
+import unity.ui.CanvasScaler;
+import unity.ui.CanvasScaler.ScaleMode;
+import unity.ui.CanvasScaler.ScreenMatchMode;
+import unity.ui.HorizontalOrVerticalLayoutGroup.AspectMode;
+import unity.ui.HorizontalOrVerticalLayoutGroup.AspectRatioFitter;
+import unity.ui.Button;
+import unity.ui.Graphic;
+import unity.ui.Image;
+import unity.ui.Mask;
+import unity.ui.RawImage;
+import unity.ui.Text;
+import unity.ui.Toggle;
+import unity.eventsystems.PointerEventData;
+import unity.tmpro.TextMeshProUGUI;
+
+// PORT-NOTE: 移植层新增（无 C# 对应源码）。**这是本工作包的核心**：把 uGUI 对象图真正画出来。
+//
+// 背景：`source/unity/ui/*`（Graphic/Image/RawImage/Text/Button/Toggle/Slider/…）在移植层是
+// **纯逻辑 shim**，`Graphic.Rebuild()` 是空实现，整包从不往 Flixel 显示列表里加任何东西。
+// 因此启动链路即使全绿，画面也是纯黑。本类补上缺失的渲染职责：
+//
+//   1. 遍历 uGUI 树（`GameObject` + `RectTransform` + `Graphic` 组件）；
+//   2. 按 Unity 的 anchor/pivot/offset 规则把 `RectTransform` 解析成**实际矩形**
+//      （见 §RectTransform 解析），Canvas 根由 `CanvasScaler` 换算分辨率（见 §Canvas 换算）；
+//   3. 每个可见的 `Graphic` 对应一个 FlxSprite / FlxText，作为本 FlxGroup 的成员进显示列表
+//      （成员顺序 = 深度优先的层级顺序，FlxGroup 按成员顺序绘制 ⇒ 与 Unity 的绘制顺序一致）。
+//
+// 与 `unity.ui.Graphic` 的关系：unity 包不能反向依赖 mvz2（会成环），因此 shim 只暴露
+// `Graphic.visualDirty` 钩子与 `Graphic.revision` 版本号；本类在 `install()` 里安装钩子。
+// 变化检测用「全局 revision + 每项记录的重建代次」：任何会改变外观的字段被写入都会 bump
+// revision，下一帧把全部项标脏重建。矩形则每帧重算（RectTransform 的字段是普通字段，
+// 无法挂钩子，例如 `MainSceneUI` 只改 `anchoredPosition`）。
+//
+// 坐标系（关键，别搞反）：
+//   * Unity RectTransform 的 rect 原点在**自身 pivot**，y 轴**向上**；子级的 anchor 相对**父级 rect**；
+//   * Flixel 的原点在**左上角**，y 轴**向下**，单位是屏幕像素；
+//   * 换算链：canvas 单位 --(父级 localScale 级联)--> 画布单位 --(CanvasScaler.scaleFactor)--> 屏幕像素。
+//
+// 已知简化（都写在报告里）：
+//   * Image 只支持 Simple/Sliced/Tiled 的**拉伸到矩形**语义；Filled（fillAmount）不裁剪，
+//     只按 fillAmount 做整体 alpha/尺寸近似 —— TODO-PORT。
+//   * LayoutGroup（Vertical/Horizontal/Grid + ContentSizeFitter + LayoutElement）不做真实布局：
+//     这些节点的子级矩形取自 prefab 里**已序列化的** anchoredPosition/sizeDelta（Unity 运行时
+//     会再算一遍，移植层直接用导出值）。因此动态增删的列表项（ElementListUI.CreateItem）位置
+//     可能与 Unity 不同。TODO-PORT。
+//   * Mask/RectMask2D 用 FlxSprite.clipRect 做矩形裁剪，不做模板缓冲。
+class UiRenderer extends FlxGroup {
+	/** 全进程唯一实例（install() 建立）。 */
+	public static var instance(default, null):UiRenderer = null;
+
+	/** 需要遍历的 uGUI 根（`MainGameScene.root` 等）。 */
+	private var roots:Array<GameObject> = [];
+	/** GameObject -> 渲染项。 */
+	private var entries:Map<GameObject, UiEntry> = new Map();
+	/**
+	 * GameObject -> 本帧解析出的布局帧。
+	 *
+	 * PORT-NOTE: 命中矩形要在遍历结束后统一解析（见 `resolveHitTargets`），
+	 * 因此遍历时必须把每个节点的布局帧留一份。只保留本帧（每帧重建），不做跨帧缓存。
+	 */
+	private var framesByNode:Map<GameObject, LayoutFrame> = new Map();
+	/** 本帧遍历到的项，顺序 = 深度优先层级顺序（即 Unity 的绘制顺序）。 */
+	private var live:Array<UiEntry> = [];
+	/** 被淘汰（GameObject 已销毁）的渲染项。 */
+	private var graveyard:Array<UiEntry> = [];
+	/** 本帧解析出的鼠标命中项（顺序 = 层级顺序，最后一个 = 最上层）。 */
+	private var hitTargets:Array<HitTarget> = [];
+	/**
+	 * 本帧遍历时收集到的「可点击节点」候选。
+	 *
+	 * PORT-NOTE: 矩形在**遍历结束后**统一解析（见 resolveHitTargets）：世界空间节点的矩形
+	 * 需要「子树里已渲染精灵的屏幕矩形」或「collider 的本地包围盒」，两者都要求整棵树先走完。
+	 */
+	private var hitCandidates:Array<HitCandidate> = [];
+	/**
+	 * GameObject -> 本帧**实际绘制出来**的屏幕矩形（取自渲染项的 FlxSprite 几何）。
+	 *
+	 * PORT-NOTE: 这是命中判定的**第一优先数据源**，也是本文件里唯一与「玩家看到的东西」
+	 * 天然一致的矩形。原先命中矩形只由 `RectTransform` 的 anchor/pivot 数学推导
+	 *（见 `childFrame`/`toScreenRect`），那条链在真实 prefab 上会与绘制结果分叉：
+	 *   * 主菜单/地图按钮的节点根本没有 RectTransform（是普通 Transform + PolygonCollider2D
+	 *     或子树里的 SpriteRenderer），数学链无从下手；
+	 *   * 有 RectTransform 的节点（如标题页 StartButton）一旦推导链里任何一环与 Unity 不同，
+	 *     算出的矩形就可能落到屏幕外 —— 表现为「按钮画得出来，但点不到」。
+	 * 改用绘制结果后，命中区与可见区**构造上相等**，不可能再分叉。
+	 */
+	private var renderedRectsByNode:Map<GameObject, unity.Rect> = new Map();
+
+	/** 诊断：本帧登记的可点击项数。 */
+	public static var hitTargetCount:Int = 0;
+	/** 诊断：其中挂在 `unity.ui.Button` 上的个数。 */
+	public static var hitTargetButtonCount:Int = 0;
+	/** 诊断：其中来自项目自定义组件（非 Button，靠 OnPointerClick 反射识别）的个数。 */
+	public static var hitTargetCustomCount:Int = 0;
+	/** 诊断：其中矩形取自 collider（Box/Polygon/Circle/CapsuleCollider2D）的个数。 */
+	public static var hitTargetColliderCount:Int = 0;
+	/** 诊断：前若干条可点击项的描述（节点路径 + 命中来源）。 */
+	public static var hitTargetSamples:Array<String> = [];
+
+	/** 诊断统计。 */
+	public static var graphicCount:Int = 0;
+	public static var textCount:Int = 0;
+	public static var solidCount:Int = 0;
+	public static var spriteRendererCount:Int = 0;
+	public static var skippedCount:Int = 0;
+	public static var lastError:String = null;
+	/** 诊断：Image 的 sprite 字段非 null 的个数（0 = prefab 注入没把 sprite 写进去）。 */
+	public static var imageWithSprite:Int = 0;
+	/** 诊断：Image 有 sprite 但取不到帧（贴图没解码 / 矩形为空）的个数。 */
+	public static var imageFrameFailed:Int = 0;
+	/** 诊断：Image 的 sprite 为 null（走纯色兜底）的个数。 */
+	public static var imageWithoutSprite:Int = 0;
+	/** 诊断：前若干条「sprite 为 null 的 Image」的节点名（定位是哪个 prefab/节点）。 */
+	public static var imageWithoutSpriteSamples:Array<String> = [];
+	/** 诊断：前若干条「有 sprite 但取帧失败」的节点名。 */
+	public static var imageFrameFailedSamples:Array<String> = [];
+	/** 诊断：Graphic 挂在非 RectTransform 上（被跳过）的节点名。 */
+	public static var nonRectGraphicSamples:Array<String> = [];
+	/** 诊断：遇到的 Graphic 具体类名 -> 次数。 */
+	public static var graphicClassCounts:Map<String, Int> = new Map();
+	/** 诊断：有 RectTransform 的 Graphic 节点数。 */
+	public static var rectGraphicCount:Int = 0;
+	/** 诊断：updateGraphic 被调用的次数。 */
+	public static var updateGraphicCalls:Int = 0;
+	/** 诊断：前若干次 updateGraphic 的分类说明。 */
+	public static var updateGraphicSamples:Array<String> = [];
+	/** 诊断：sync() 结束时的计数快照（保证同一帧内一致，避免读取时序问题）。 */
+	public static var snapshot:String = "";
+
+	/** 复用的 1x1 白色位图（纯色 Image 的底图），避免每个纯色块各建一张。 */
+	private static inline var WHITE_KEY:String = "mvz2_ui_white";
+
+	/** 上一次同步时的 Graphic 全局 revision。 */
+	private var lastRevision:Int = -1;
+	/** 已同步的帧序号（用于淘汰扫描）。 */
+	private var frame:Int = 0;
+
+	/** 当前成员里 visible == true 的项数（诊断用：0 = 画面上真的什么都没有）。 */
+	public var visibleCount(default, null):Int = 0;
+
+	private function new() {
+		super();
+		// PORT-NOTE: 本组不是"可交互对象"，只需 update + draw。
+		active = true;
+		visible = true;
+	}
+
+	// #region 安装 / 注册
+
+	/**
+	 * 建立渲染桥并把 `root` 登记为遍历起点。幂等。
+	 *
+	 * PORT-NOTE: 必须挂在 `FlxG.state` 上（而不是 `FlxG.plugins`）：plugins 的绘制顺序由
+	 * `FlxG.plugins.drawOnTop` 全局决定，会影响其它插件的绘制层；而 UI 必须永远盖在游戏画面之上
+	 * （Unity 的 ScreenSpaceOverlay Canvas 语义）。挂进 FlxState 的成员表并最后添加即可。
+	 */
+	public static function install(root:GameObject):UiRenderer {
+		Graphic.visualDirty = onVisualDirty;
+		if (instance == null) {
+			instance = new UiRenderer();
+			if (FlxG.state != null)
+				FlxG.state.add(instance);
+		}
+		if (root != null)
+			instance.registerRoot(root);
+		return instance;
+	}
+
+	/** 追加一个遍历根（可多次调用，例如关卡场景）。 */
+	public function registerRoot(root:GameObject):Void {
+		if (root == null || roots.indexOf(root) >= 0)
+			return;
+		roots.push(root);
+		lastRevision = -1;
+	}
+
+	private static function onVisualDirty():Void {
+		// PORT-NOTE: 这里刻意不做同步工作 —— 写入发生在游戏逻辑（Update/协程）里，
+		// 而重建渲染对象必须在绘制前统一做（见 update()）。只把 revision 拉高，
+		// 由下一帧的 sync() 统一重建。
+	}
+
+	// #endregion
+
+	// #region 每帧同步
+
+	override public function update(elapsed:Float):Void {
+		super.update(elapsed);
+		frame++;
+		try {
+			sync();
+		} catch (e:Dynamic) {
+			lastError = Std.string(e);
+			unity.Debug.LogError('UiRenderer.sync 失败（本帧跳过 UI 同步）：$e');
+		}
+	}
+
+	/** 重建/更新全部渲染项。 */
+	public function sync():Void {
+		if (roots.length == 0)
+			return;
+		var revisionChanged = lastRevision != Graphic.revision;
+		lastRevision = Graphic.revision;
+		live = [];
+		framesByNode = new Map();
+		renderedRectsByNode = new Map();
+		hitTargets = [];
+		hitCandidates = [];
+		hitTargetCount = 0;
+		hitTargetButtonCount = 0;
+		hitTargetCustomCount = 0;
+		hitTargetColliderCount = 0;
+		if (hitTargetSamples.length > 0) hitTargetSamples = [];
+		graphicCount = 0;
+		textCount = 0;
+		solidCount = 0;
+		spriteRendererCount = 0;
+		skippedCount = 0;
+		imageWithSprite = 0;
+		imageFrameFailed = 0;
+		imageWithoutSprite = 0;
+		if (imageWithoutSpriteSamples.length > 0) imageWithoutSpriteSamples = [];
+		if (imageFrameFailedSamples.length > 0) imageFrameFailedSamples = [];
+		if (nonRectGraphicSamples.length > 0) nonRectGraphicSamples = [];
+		graphicClassCounts = new Map();
+		rectGraphicCount = 0;
+		updateGraphicCalls = 0;
+		if (updateGraphicSamples.length > 0) updateGraphicSamples = [];
+
+		for (root in roots) {
+			if (root == null)
+				continue;
+			var canvas = findCanvas(root);
+			if (canvas != null) {
+				walkCanvas(canvas, root);
+			} else {
+				// PORT-NOTE: 没有 Canvas 时仍按"画布 = 整个屏幕"处理，让手工构造的对象图
+				// （`MainGameScene.buildDialog` 等只 `new Image()`、没挂 Canvas 的 UI）也能画出来。
+				// 此时 scaleFactor 取最近的 CanvasScaler（找不到则 1）。
+				var scaler = findCanvasScaler(root);
+				var scale = scaler != null ? computeScaleFactor(scaler) : 1;
+				walk(root, screenFrame(scale), revisionChanged);
+			}
+		}
+		applyOrder();
+		// PORT-NOTE: 命中矩形必须在**整棵树走完之后**解析：世界空间节点（SpriteRenderer /
+		// collider 一类，如 Mainmenu 的 MainmenuButton、Map 的 MapButton）自身没有 RectTransform，
+		// 矩形只能取「子树里已渲染精灵的屏幕矩形」或「collider 的本地包围盒」。
+		resolveHitTargets();
+		processPointer();
+		reap();
+		// PORT-NOTE: 在同一帧内拍快照。`MainSceneState.update` 里 logUiStats() 在 super.update()
+		// **之前**调用，直接读静态计数会拿到"上一帧 sync 之后、本帧 sync 之前"的值；
+		// 若两者时序对不上，读到的就是半成品。快照在 sync() 末尾生成，永远自洽。
+		var clsList:Array<String> = [];
+		for (k in graphicClassCounts.keys())
+			clsList.push('$k=${graphicClassCounts.get(k)}');
+		snapshot = '可见项=$visibleCount 成员=$length Graphic=$graphicCount(有Rect=$rectGraphicCount)'
+			+ ' 文本=$textCount 纯色=$solidCount 世界精灵=$spriteRendererCount 跳过=$skippedCount'
+			+ ' updateGraphic调用=$updateGraphicCalls Image有sprite=$imageWithSprite'
+			+ ' Image无sprite=$imageWithoutSprite Image取帧失败=$imageFrameFailed'
+			+ ' 可点击=$hitTargetCount(Button=$hitTargetButtonCount 自定义=$hitTargetCustomCount 用collider=$hitTargetColliderCount)'
+			+ ' 类=[${clsList.join(",")}]';
+	}
+
+	/**
+	 * 把本帧遍历到的项按深度优先顺序写回 FlxGroup 的成员表。
+	 *
+	 * PORT-NOTE: 用 `members.resize(n)` + 逐位赋值而不是 clear()+add()：`clear()` 会把
+	 * 全部成员槽位置空、`add()` 又从 0 号槽开始填，当项数多于槽位数时 `add()` 会
+	 * splice 到数组头部（flixel 的"复用空槽"策略），顺序被打乱。逐位赋值既稳定又不产生垃圾。
+	 */
+	private function applyOrder():Void {
+		// PORT-NOTE: Unity 对 SpriteRenderer 按 (sortingLayer, sortingOrder) 排序，而 UI 按层级顺序。
+		// 移植层在同一棵树上同时有两类：这里把 SpriteRenderer 项**在彼此之间**按
+		// (sortingLayerID, sortingOrder) 稳定排序（其余项保持层级顺序）。
+		// 实例：Mainmenu.prefab 的 `WindowView` 排序层 -10（最靠后），但它在兄弟表里排第 7，
+		// 不排序会盖住背景。
+		if (spriteRendererCount > 1)
+			stableSortWorldSprites();
+		var n = live.length;
+		if (members.length != n)
+			members.resize(n);
+		length = n;
+		visibleCount = 0;
+		// PORT-NOTE: `textCount` 必须统计**本帧的文本项数**，而不是「本帧新建的 FlxText 数」。
+		// 原先只在 `updateText` 里换类型的那一刻 `textCount++`，而渲染项是跨帧复用的 ——
+		// 于是除了首帧之外它恒为 0。实测症状：画面上 14 个 TextMeshProUGUI 明明都渲染出来了
+		// （`类=[unity.tmpro.TextMeshProUGUI=14,...]`），boot-trace 却报 `文本=0`，
+		// 让人误判「文字没画出来」（黑屏报告的 §4.4 就是被这条误导的）。
+		textCount = 0;
+		for (i in 0...n) {
+			members[i] = live[i].sprite;
+			if (live[i].sprite.visible)
+				visibleCount++;
+			if (live[i].kind == UiEntryKind.Label)
+				textCount++;
+		}
+	}
+
+	/** 对 live 里的 SpriteRenderer 项按 (sortingLayerID, sortingOrder) 排序。 */
+	private function stableSortWorldSprites():Void {
+		var indices:Array<Int> = [];
+		for (i in 0...live.length) {
+			if (live[i].kind == UiEntryKind.WorldSprite)
+				indices.push(i);
+		}
+		if (indices.length < 2)
+			return;
+		// PORT-NOTE: Haxe 的 Array.sort 不保证稳定，故用 (层, 序, 原下标) 三元组排序，
+		// 保证同键的项保持层级顺序。
+		var keys:Array<{layer:Int, order:Int, index:Int, entry:UiEntry}> = [];
+		for (i in indices) {
+			var r = live[i].worldRenderer;
+			keys.push({
+				layer: r != null ? r.sortingLayerID : 0,
+				order: r != null ? r.sortingOrder : 0,
+				index: i,
+				entry: live[i]
+			});
+		}
+		keys.sort(function(a, b) {
+			// PORT-NOTE: 排序键必须用 `SortingLayer.SortKeyOf`（层序号 → 打包）而不是**裸的
+			// sortingLayerID**：Unity 的层 ID 是 uniqueID 的哈希，**无符号序**才有层级意义。
+			// 裸比大小会把 `Foreground(-4036897)` 排到 `Default(0)` 之前（应为之后），
+			// 也会把 `ScreenCover(1206696159)` 排到 `Talk(1660876549)` 之前（应为之后）。
+			// 层序来自 `ProjectSettings/TagManager.asset`（见 unity/SortingLayer.hx）。
+			var ka = SortingLayer.SortKeyOf(a.layer, a.order);
+			var kb = SortingLayer.SortKeyOf(b.layer, b.order);
+			if (ka != kb)
+				return ka < kb ? -1 : 1;
+			return a.index - b.index;
+		});
+		for (k in 0...indices.length)
+			live[indices[k]] = keys[k].entry;
+	}
+
+	private function reap():Void {
+		// PORT-NOTE: 只有当"登记过的项数"与"本帧遍历到的项数"不一致时才做全表扫描 ——
+		// 正常情况下每帧都相等，省掉 Map 的遍历。另外每 120 帧兜底扫一次，
+		// 覆盖"一增一减、数量恰好相等"的边界。
+		if (Lambda.count(entries) != live.length || (frame % 120) == 0) {
+			for (go in entries.keys()) {
+				var entry = entries.get(go);
+				if (entry.lastSeenFrame != frame)
+					retire(entry);
+			}
+		}
+		if (graveyard.length == 0)
+			return;
+		for (entry in graveyard) {
+			entry.sprite.destroy();
+			entries.remove(entry.gameObject);
+		}
+		graveyard = [];
+	}
+
+	/** 一个 GameObject 从遍历中消失（未激活或已销毁）时调用。 */
+	private function retire(entry:UiEntry):Void {
+		if (entry.retired)
+			return;
+		entry.retired = true;
+		// PORT-NOTE: 不能在这里 destroy() —— 遍历过程中 `destroy()` 会改到 FlxGroup 的成员表；
+		// 且 `applyOrder()` 之后本项已不在成员表里，销毁是安全的，故推迟到 reap()。
+		graveyard.push(entry);
+	}
+
+	// #region 鼠标命中 → OnPointerClick 派发
+
+	/**
+	 * 把一个节点登记为「可点击候选」。
+	 *
+	 * PORT-NOTE: 原先这里只认 `unity.ui.Button`，于是**项目自定义的可点击组件**
+	 * （`mvz2.ui.mainmenu.MainmenuButton`、`mvz2.ui.map.MapButton`、`mvz2.ui.map.MapElementButton`、
+	 * `mvz2.ui.scene.DebugConsoleIcon`、`mvz2.ui.almanac.AlmanacDescriptionLinkHandler`、
+	 * `mvz2.ui.debugconsole.DebugConsoleInputField` …）全部收不到点击，主菜单/地图/图鉴的按钮
+	 * 在移植层是死的。
+	 *
+	 * 判据：**组件上存在可调用的 `OnPointerClick` 方法**（uGUI 的 `IPointerClickHandler`
+	 * 与项目自定义组件都按这个约定实现，见 `unity/eventsystems/IEventSystemHandler.hx`）。
+	 * 刻意不写具体类名/页面名，新增可点击组件时无需改本文件。
+	 *
+	 * PORT-NOTE: 不用 `Std.isOfType(c, IPointerClickHandler)` 判定接口：hxcpp 会把
+	 * `Std.isOfType(x, ClassOf<T>())` 优化成数字类索引常量，`IEventSystemHandler.hx`
+	 * 一个模块里声明了 20 个接口，索引必然取错（同一缺陷见 `updateGraphic` 的 Image 分支说明）。
+	 * 反射走的是类对象自身的字段表，与模块布局无关；本工程既有的
+	 * `ScenePrefabLoader.callAwake`（找 `Awake`）、`AnimatorRuntime.invokeEvent`（找动画事件方法）
+	 * 都是同一条路，实测在 release 构建下有效。
+	 */
+	private function registerHitCandidate(go:GameObject):Void {
+		var handlers = findClickHandlers(go);
+		if (handlers.length == 0)
+			return;
+		var rt = isInstanceOf(go.transform, RectTransform) ? cast(go.transform, RectTransform) : null;
+		hitCandidates.push({
+			gameObject: go,
+			handlers: handlers,
+			hasRectTransform: rt != null,
+			rect: null,
+			order: hitCandidates.length
+		});
+	}
+
+	/** 该节点上全部「有 OnPointerClick 方法」的组件（顺序 = 组件顺序）。 */
+	private static function findClickHandlers(go:GameObject):Array<Dynamic> {
+		var result:Array<Dynamic> = [];
+		for (c in go.GetAllComponents()) {
+			if (c == null || c.destroyed)
+				continue;
+			var fn:Dynamic = Reflect.field(c, "OnPointerClick");
+			if (fn != null && Reflect.isFunction(fn))
+				result.push(c);
+		}
+		return result;
+	}
+
+	/**
+	 * 遍历结束后统一解析每个候选的屏幕矩形。
+	 *
+	 * PORT-NOTE: 矩形来源按优先级四级回落（都不需要知道具体页面）：
+	 *   1. **节点自身本帧实际绘制出来的矩形**（`renderedRectsByNode`，见其说明）。
+	 *      这是与玩家所见**构造上一致**的来源，也是唯一能同时覆盖「uGUI 控件」与
+	 *      「世界空间精灵按钮」的来源，因此排在最前。
+	 *   2. 节点自身是 `RectTransform`（uGUI 控件）→ 用 `walk` 已经算好的布局帧。
+	 *      仅当该节点本帧没画出任何东西时才会走到这里（例如透明 Image 做的命中区）。
+	 *   3. 节点自身或**子树**里有 2D 碰撞体（`BoxCollider2D` / `PolygonCollider2D` /
+	 *      `CircleCollider2D` / `CapsuleCollider2D`）→ 用碰撞体的本地包围盒按正交相机换算。
+	 *   4. 子树里有 `RectTransform` / 已绘制精灵 → 取这些子节点的屏幕矩形并集。
+	 * 第 3/4 级必须放在遍历之后：两者都要先走完整棵子树才知道有哪些子节点。
+	 */
+	private function resolveHitTargets():Void {
+		for (candidate in hitCandidates) {
+			var go = candidate.gameObject;
+			if (go == null || go.destroyed || !go.activeInHierarchy)
+				continue;
+			var rect = renderedRectsByNode.get(go);
+			var source = "绘制结果";
+			if (rect == null || rect.width <= 0 || rect.height <= 0) {
+				rect = candidate.hasRectTransform ? rectOfNode(go) : null;
+				source = "RectTransform";
+			}
+			if (rect == null || rect.width <= 0 || rect.height <= 0) {
+				rect = rectOfCollider(go);
+				if (rect != null)
+					source = "Collider2D";
+			}
+			if (rect == null || rect.width <= 0 || rect.height <= 0) {
+				rect = rectOfDescendantRects(go);
+				if (rect != null)
+					source = "子级 RectTransform 并集";
+			}
+			if (rect == null || rect.width <= 0 || rect.height <= 0)
+				continue;
+			var isButton = go.GetComponent(Button) != null;
+			hitTargets.push({
+				gameObject: go,
+				handlers: candidate.handlers,
+				rect: rect,
+				order: candidate.order,
+				isButton: isButton
+			});
+			hitTargetCount++;
+			if (isButton)
+				hitTargetButtonCount++;
+			else
+				hitTargetCustomCount++;
+			if (source == "Collider2D")
+				hitTargetColliderCount++;
+			if (hitTargetSamples.length < 16)
+				hitTargetSamples.push('${nodePath(go)} [${source} ${Std.int(rect.x)},${Std.int(rect.y)} '
+					+ '${Std.int(rect.width)}x${Std.int(rect.height)}]');
+		}
+	}
+
+	/** 节点自身 RectTransform 的屏幕矩形（遍历时已算好并缓存）。 */
+	private function rectOfNode(go:GameObject):unity.Rect {
+		var frame = framesByNode.get(go);
+		return frame != null ? toScreenRect(frame) : null;
+	}
+
+	/**
+	 * 节点自身或子树里的 2D 碰撞体 → 屏幕矩形。
+	 *
+	 * PORT-NOTE: 碰撞体的 `size` / `points` / `radius` 都是**世界单位**（Unity 的物理单位），
+	 * 因此先按 `transform.lossyScale` 换算到世界尺寸，再用正交相机的「每世界单位多少屏幕像素」
+	 * （`Camera.pixelsPerUnit`）换算到屏幕像素。这与 `updateSpriteRenderer` 用的是同一套换算。
+	 */
+	private function rectOfCollider(go:GameObject):unity.Rect {
+		var collider = findCollider(go);
+		if (collider == null || collider.transform == null)
+			return null;
+		var half = colliderHalfExtents(collider);
+		if (half == null || half.x <= 0 || half.y <= 0)
+			return null;
+		var ppu = orthographicPixelsPerUnit();
+		if (ppu <= 0)
+			return null;
+		var scale = collider.transform.lossyScale;
+		var origin = cameraOrigin();
+		var world = worldPositionOf(collider.transform);
+		var centerX = world.x + collider.offset.x * scale.x;
+		var centerY = world.y + collider.offset.y * scale.y;
+		var halfWidth = half.x * Math.abs(scale.x) * ppu;
+		var halfHeight = half.y * Math.abs(scale.y) * ppu;
+		var screenX = FlxG.width * 0.5 + (centerX - origin.x) * ppu;
+		var screenY = FlxG.height * 0.5 - (centerY - origin.y) * ppu;
+		return new unity.Rect(screenX - halfWidth, screenY - halfHeight, halfWidth * 2, halfHeight * 2);
+	}
+
+	/** 节点自身优先，其次子树（对应 Unity 的 `GetComponent` / `GetComponentInChildren` 顺序）。 */
+	private function findCollider(go:GameObject):Collider2D {
+		var own = go.GetComponent(Collider2D);
+		if (own != null)
+			return own;
+		return go.GetComponentInChildren(Collider2D, true);
+	}
+
+	/** 碰撞体在**本地单位**下的半宽/半高（`null` = 该碰撞体类型没有可用几何）。 */
+	private function colliderHalfExtents(collider:Collider2D):Vector2 {
+		if (isInstanceOf(collider, BoxCollider2D)) {
+			var box:BoxCollider2D = cast collider;
+			return new Vector2(box.size.x * 0.5, box.size.y * 0.5);
+		}
+		if (isInstanceOf(collider, CircleCollider2D)) {
+			var circle:CircleCollider2D = cast collider;
+			return new Vector2(circle.radius, circle.radius);
+		}
+		if (isInstanceOf(collider, CapsuleCollider2D)) {
+			var capsule:CapsuleCollider2D = cast collider;
+			return new Vector2(capsule.size.x * 0.5, capsule.size.y * 0.5);
+		}
+		if (isInstanceOf(collider, PolygonCollider2D)) {
+			var polygon:PolygonCollider2D = cast collider;
+			var points = polygon.points;
+			if (points == null || points.length == 0)
+				return null;
+			var minX = Math.POSITIVE_INFINITY;
+			var minY = Math.POSITIVE_INFINITY;
+			var maxX = Math.NEGATIVE_INFINITY;
+			var maxY = Math.NEGATIVE_INFINITY;
+			for (p in points) {
+				if (p == null)
+					continue;
+				minX = Math.min(minX, p.x);
+				maxX = Math.max(maxX, p.x);
+				minY = Math.min(minY, p.y);
+				maxY = Math.max(maxY, p.y);
+			}
+			if (minX > maxX || minY > maxY)
+				return null;
+			return new Vector2((maxX - minX) * 0.5, (maxY - minY) * 0.5);
+		}
+		return null;
+	}
+
+	/**
+	 * 节点在世界空间里的位置。
+	 *
+	 * PORT-NOTE: 移植层没有做「localPosition → position」的层级级联（`ScenePrefabLoader` 只写
+	 * `localPosition`，`Transform.position` 保持默认值），因此这里按 Unity 的语义**就地累加**：
+	 * 从根往下逐级 `world = parentWorld + parentScale * local`。父级缩放取 `localScale` 级联值。
+	 * 这与 `updateSpriteRenderer` 直接用 `tr.position` 的做法不同——后者对 prefab 加载的节点
+	 * 拿到的是未级联的 (0,0,0)。TODO-PORT: 级联应由 Transform 层统一提供（属另一工作包）。
+	 */
+	private function worldPositionOf(tr:Transform):Vector3 {
+		var chain:Array<Transform> = [];
+		var t:Transform = tr;
+		var guard = 0;
+		while (t != null && guard++ < 64) {
+			chain.push(t);
+			t = t.parent;
+		}
+		var position = new Vector3(0, 0, 0);
+		var scale = new Vector3(1, 1, 1);
+		var i = chain.length - 1;
+		while (i >= 0) {
+			var local = chain[i].localPosition;
+			if (local != null) {
+				position.x += local.x * scale.x;
+				position.y += local.y * scale.y;
+				position.z += local.z * scale.z;
+			}
+			var localScale = chain[i].localScale;
+			if (localScale != null) {
+				scale.x *= localScale.x;
+				scale.y *= localScale.y;
+				scale.z *= localScale.z;
+			}
+			i--;
+		}
+		return position;
+	}
+
+	/** 子树里全部 RectTransform 节点的屏幕矩形并集（第 3 级回落）。 */
+	private function rectOfDescendantRects(go:GameObject):unity.Rect {
+		var minX = Math.POSITIVE_INFINITY;
+		var minY = Math.POSITIVE_INFINITY;
+		var maxX = Math.NEGATIVE_INFINITY;
+		var maxY = Math.NEGATIVE_INFINITY;
+		var found = false;
+		for (child in go.transform.children) {
+			if (child == null || child.gameObject == null)
+				continue;
+			if (!child.gameObject.activeInHierarchy)
+				continue;
+			var rect = unionSubtree(child.gameObject, function(r) {
+				minX = Math.min(minX, r.x);
+				minY = Math.min(minY, r.y);
+				maxX = Math.max(maxX, r.x + r.width);
+				maxY = Math.max(maxY, r.y + r.height);
+			});
+			if (rect)
+				found = true;
+		}
+		if (!found || minX > maxX || minY > maxY)
+			return null;
+		return new unity.Rect(minX, minY, maxX - minX, maxY - minY);
+	}
+
+	/** 深度优先收集子树里所有**已绘制**（或已算出布局帧）的节点矩形；返回是否至少命中一个。 */
+	private function unionSubtree(go:GameObject, visit:unity.Rect->Void):Bool {
+		var found = false;
+		// PORT-NOTE: 优先取「实际绘制结果」——主菜单/地图按钮的可见内容在**子节点**的
+		// SpriteRenderer 上，而子节点没有 RectTransform（framesByNode 里没有它），
+		// 只读布局帧会让这类按钮的命中区并集恒为空。
+		var drawn = renderedRectsByNode.get(go);
+		if (drawn != null && drawn.width > 0 && drawn.height > 0) {
+			visit(drawn);
+			found = true;
+		} else {
+			var frame = framesByNode.get(go);
+			if (frame != null) {
+				var rect = toScreenRect(frame);
+				if (rect.width > 0 && rect.height > 0) {
+					visit(rect);
+					found = true;
+				}
+			}
+		}
+		for (child in go.transform.children) {
+			if (child == null || child.gameObject == null)
+				continue;
+			if (!child.gameObject.activeInHierarchy)
+				continue;
+			if (unionSubtree(child.gameObject, visit))
+				found = true;
+		}
+		return found;
+	}
+
+	/** 该可点击节点当前是否接受指针（CanvasGroup + Selectable 的 Unity 语义）。 */
+	private function isHitTargetEnabled(target:HitTarget):Bool {
+		var go = target.gameObject;
+		if (go == null || go.destroyed || !go.activeInHierarchy)
+			return false;
+		// CanvasGroup：`blocksRaycasts = false` 在 Unity 里让整棵子树不接收射线；
+		// `interactable = false` 让 Selectable 变成不可交互（LevelUIPreset.SetReceiveRaycasts 用前者）。
+		var tr:Transform = go.transform;
+		var guard = 0;
+		while (tr != null && guard++ < 64) {
+			if (tr.gameObject != null) {
+				var group = tr.gameObject.GetComponent(CanvasGroup);
+				if (group != null && (!group.blocksRaycasts || !group.interactable))
+					return false;
+			}
+			tr = tr.parent;
+		}
+		// Selectable（Button/Toggle/…）：不可交互时不派发。
+		// 自定义组件（MainmenuButton 等）的可用性由各自的 `OnPointerClick` 内部判定
+		//（MainmenuButton 自己检查 `Interactable`、MapButton/MapElementButton 检查 `IsInteractable()`），
+		// 这里不重复猜它们的字段名。
+		for (handler in target.handlers) {
+			if (isInstanceOf(handler, unity.ui.Selectable)) {
+				var selectable:unity.ui.Selectable = cast handler;
+				if (!selectable.IsInteractable())
+					return false;
+			}
+		}
+		return true;
+	}
+
+	/**
+	 * 每帧的指针处理：悬停（enter/exit）+ 左键点击。
+	 *
+	 * PORT-NOTE: 原先这里**只**处理点击，`OnPointerEnter` / `OnPointerExit` 从来不派发。
+	 * 后果不只是"没有悬停高亮"：
+	 *   * `MainmenuButton.OnPointerEnter` 是它把 `isHovered` 置位、进而 `UpdateSprite()`
+	 *     切到 `hoveredSprite` 的唯一途径（`MainmenuController.OnMainmenuButtonUpdateSpriteCallback`
+	 *     依赖它），所以主菜单按钮永远停在常态图；
+	 *   * `CursorHandler.OnPointerEnter` 是鼠标指针切换形状（`Global.Cursors.AddCursorSource`）
+	 *     的唯一途径，缺了它光标在整个 UI 上都是默认箭头。
+	 * uGUI 的语义是"指针每帧移动就重算当前命中项，变化时对旧项 exit、对新项 enter"，
+	 * 这里按同一语义实现。
+	 */
+	private function processPointer():Void {
+		#if FLX_MOUSE
+		if (FlxG.mouse == null)
+			return;
+		var x = FlxG.mouse.screenX;
+		var y = FlxG.mouse.screenY;
+		// PORT-NOTE: 取**最后一个**命中项 —— `hitTargets` 的顺序就是深度优先的层级顺序
+		// （即 Unity 的绘制顺序），最后一个即最上层，与 uGUI 的射线拾取一致。
+		var best:HitTarget = null;
+		for (target in hitTargets) {
+			if (!isHitTargetEnabled(target))
+				continue;
+			if (x >= target.rect.x && x <= target.rect.x + target.rect.width
+				&& y >= target.rect.y && y <= target.rect.y + target.rect.height)
+				best = target;
+		}
+		dispatchHover(best, x, y);
+		if (FlxG.mouse.justPressed && best != null)
+			dispatchPointerClick(best, x, y);
+		#end
+	}
+
+	/** 当前悬停项发生变化时派发 exit / enter（对应 uGUI 的指针进入/离开）。 */
+	private function dispatchHover(best:HitTarget, x:Float, y:Float):Void {
+		var bestGo = best != null ? best.gameObject : null;
+		if (hoveredTarget != null && hoveredTarget.gameObject != bestGo) {
+			var old = hoveredTarget;
+			hoveredTarget = null;
+			dispatchPointerEvent(old, "OnPointerExit", x, y);
+		}
+		if (best != null && (hoveredTarget == null || hoveredTarget.gameObject != bestGo)) {
+			hoveredTarget = best;
+			dispatchPointerEvent(best, "OnPointerEnter", x, y);
+		}
+	}
+
+	/** 本帧悬停的节点（用于下一帧判断是否需要 exit）。 */
+	private var hoveredTarget:HitTarget = null;
+
+	/**
+	 * 向命中节点上的全部组件派发一次指定名字的指针事件（`OnPointerExit` / `OnPointerEnter`）。
+	 *
+	 * PORT-NOTE: 与 `dispatchPointerClick` 同样逐个 try/catch —— 单个处理器抛异常
+	 * 不应中断其它处理器与整帧同步。
+	 */
+	private function dispatchPointerEvent(target:HitTarget, method:String, x:Float, y:Float):Void {
+		if (target == null)
+			return;
+		var eventData = new PointerEventData();
+		eventData.position = new Vector2(x, y);
+		eventData.pressPosition = new Vector2(x, y);
+		eventData.pointerId = -1;
+		eventData.button = unity.eventsystems.PointerEventData.InputButton.Left;
+		eventData.pointerEnter = target.gameObject;
+		for (handler in target.handlers) {
+			var fn:Dynamic = Reflect.field(handler, method);
+			if (fn == null || !Reflect.isFunction(fn))
+				continue;
+			try {
+				Reflect.callMethod(handler, fn, [eventData]);
+			} catch (e:Dynamic) {
+				lastError = '${nodePath(target.gameObject)} 的 $method 抛出：$e';
+				unity.Debug.LogError('UiRenderer：${nodePath(target.gameObject)} 的 $method 抛出异常：$e');
+			}
+		}
+	}
+
+	/**
+	 * 向命中节点上的全部 `OnPointerClick` 组件派发一次点击。
+	 *
+	 * PORT-NOTE: 事件数据按 Unity 的 `PointerEventData` 语义填齐（指针 id 为鼠标左键、位置、
+	 * 以及 `pointerCurrentRaycast`）。`pointerId = -1` 是移植层对「鼠标左键」的约定
+	 * （见 `InputHelper.GetPointerIdByButtonAndType`：`-button - 1`），
+	 * `MapButton` / `MapElementButton` 会据此过滤掉非左键。
+	 */
+	private function dispatchPointerClick(target:HitTarget, x:Float, y:Float):Void {
+		var eventData = new PointerEventData();
+		eventData.position = new Vector2(x, y);
+		eventData.pressPosition = new Vector2(x, y);
+		eventData.pointerId = -1;
+		eventData.button = unity.eventsystems.PointerEventData.InputButton.Left;
+		eventData.pointerEnter = target.gameObject;
+		eventData.pointerPress = target.gameObject;
+		eventData.pointerClick = target.gameObject;
+		// 部分处理器会读 `pointerCurrentRaycast`（如 `LevelController.UI_OnGridPointerInteractionCallback`
+		// 取 worldPosition / screenPosition），这里按相机换算填好，避免下游拿到零值。
+		var raycast = eventData.pointerCurrentRaycast;
+		if (raycast != null) {
+			raycast.gameObject = target.gameObject;
+			raycast.screenPosition = new Vector2(x, y);
+			raycast.worldPosition = screenToWorld(x, y);
+			raycast.isValid = true;
+		}
+		for (handler in target.handlers) {
+			var fn:Dynamic = Reflect.field(handler, "OnPointerClick");
+			if (fn == null || !Reflect.isFunction(fn))
+				continue;
+			try {
+				Reflect.callMethod(handler, fn, [eventData]);
+			} catch (e:Dynamic) {
+				// PORT-NOTE: 单个处理器抛异常不应中断其它处理器与整帧同步（Unity 的事件系统
+				// 也是逐个 try/catch 记录）。记录到 lastError 便于诊断。
+				lastError = '${nodePath(target.gameObject)} 的 OnPointerClick 抛出：$e';
+				unity.Debug.LogError('UiRenderer：${nodePath(target.gameObject)} 的 OnPointerClick 抛出异常：$e');
+			}
+		}
+	}
+
+	/** 屏幕像素（Flixel 左上原点）→ 世界坐标（按当前正交相机）。 */
+	private function screenToWorld(x:Float, y:Float):Vector3 {
+		var ppu = orthographicPixelsPerUnit();
+		if (ppu <= 0)
+			return new Vector3(0, 0, 0);
+		var origin = cameraOrigin();
+		return new Vector3(
+			origin.x + (x - FlxG.width * 0.5) / ppu,
+			origin.y + (FlxG.height * 0.5 - y) / ppu,
+			0);
+	}
+
+	// #endregion
+
+	// #endregion
+
+	// #region 树遍历 + RectTransform 解析
+
+	/**
+	 * 一个节点的布局帧（把"canvas 单位 → 屏幕像素"的全部信息打包）。
+	 *
+	 * `local`   —— 该节点在**自身局部坐标系**里的矩形（原点在自身 pivot，与 Unity 的
+	 *              `RectTransform.rect` 语义一致）。
+	 * `origin`  —— 该节点 pivot 在**屏幕像素**里的位置。
+	 * `scale`   —— 该节点的局部单位 → 屏幕像素的比例。
+	 * `clip`    —— 祖先 Mask/RectMask2D 产生的裁剪矩形（屏幕像素），null 表示不裁剪。
+	 */
+	private function frameFor(canvasScale:Float, ownScale:Float, ?origin:Vector2, ?local:unity.Rect, ?clip:unity.Rect,
+			?scale:Float):LayoutFrame {
+		return {
+			canvasScale: canvasScale,
+			ownScale: ownScale,
+			scale: scale != null ? scale : canvasScale * ownScale,
+			origin: origin != null ? origin : new Vector2(0, 0),
+			local: local != null ? local : new unity.Rect(0, 0, 0, 0),
+			clip: clip
+		};
+	}
+
+	/** 从任意节点向上找最近的 Canvas 组件。 */
+	private function findCanvas(go:GameObject):Canvas {
+		var tr:Transform = go != null ? go.transform : null;
+		while (tr != null) {
+			if (tr.gameObject != null) {
+				var c = tr.gameObject.GetComponent(Canvas);
+				if (c != null)
+					return c;
+			}
+			tr = tr.parent;
+		}
+		return null;
+	}
+
+	/** 从任意节点向上找最近的 CanvasScaler 组件。 */
+	private function findCanvasScaler(go:GameObject):CanvasScaler {
+		var tr:Transform = go != null ? go.transform : null;
+		while (tr != null) {
+			if (tr.gameObject != null) {
+				var c = tr.gameObject.GetComponent(CanvasScaler);
+				if (c != null)
+					return c;
+			}
+			tr = tr.parent;
+		}
+		return null;
+	}
+
+	/** 画布根：矩形 = 屏幕 / scaleFactor（Unity 的 ScreenSpaceOverlay 画布 rect），原点在画布中心。 */
+	private function screenFrame(scale:Float):LayoutFrame {
+		var w = FlxG.width / scale;
+		var h = FlxG.height / scale;
+		// PORT-NOTE: 画布根自身的 pivot 是 (0.5, 0.5)（Unity 对根 Canvas 强制如此），
+		// 所以它的 local rect 以原点为中心。origin（pivot 的屏幕位置）= 屏幕中心。
+		var local = new unity.Rect(-w * 0.5, -h * 0.5, w, h);
+		var origin = new Vector2(FlxG.width * 0.5, FlxG.height * 0.5);
+		return frameFor(scale, 1, origin, local);
+	}
+
+	private function walkCanvas(canvas:Canvas, searchRoot:GameObject):Void {
+		var scaler = canvas.gameObject != null ? canvas.gameObject.GetComponent(CanvasScaler) : null;
+		var scale = computeScaleFactor(scaler);
+		canvas.scaleFactor = scale;
+		var frame = screenFrame(scale);
+		// PORT-NOTE: Canvas 自身也可能挂 Graphic（罕见），按同一规则生成渲染项。
+		renderNode(canvas.gameObject, frame, true);
+		walk(canvas.gameObject, frame, true);
+	}
+
+	/**
+	 * 深度优先遍历，按 Unity 规则解析每个 RectTransform 的屏幕矩形并生成渲染项。
+	 *
+	 * @param parent   父节点的布局帧
+	 * @param forceDirty 全局 revision 变化时，全部项都重建（无法逐项定位是哪个字段变了）
+	 */
+	private function walk(parent:GameObject, parentFrame:LayoutFrame, forceDirty:Bool):Void {
+		if (parent == null)
+			return;
+		var parentTr = parent.transform;
+		if (parentTr == null)
+			return;
+		for (child in parentTr.children) {
+			if (child == null || child.gameObject == null)
+				continue;
+			var go = child.gameObject;
+			// PORT-NOTE: Unity 不绘制未激活节点及其子树（activeInHierarchy）。
+			if (!go.activeInHierarchy)
+				continue;
+			var rt = isInstanceOf(child, RectTransform) ? cast(child, RectTransform) : null;
+			var frame = rt != null ? childFrame(rt, parentFrame) : parentFrame;
+			if (rt != null) {
+				var aspect = go.GetComponent(AspectRatioFitter);
+				if (aspect != null) {
+					if (frame.local.width <= 0 || frame.local.height <= 0)
+						frame = parentFrame;
+					frame = applyAspectRatio(frame, aspect);
+				}
+			}
+
+			renderNode(go, frame, forceDirty);
+			// 子级：若自身带 Canvas，则它开启一个新的画布（自己的 CanvasScaler）。
+			var nested = go.GetComponent(Canvas);
+			if (nested != null) {
+				walkCanvas(nested, go);
+				continue;
+			}
+			// PORT-NOTE: Mask / RectMask2D 只影响**子树**，不影响本节点自身；因此这里派生出
+			// 一份带裁剪的帧给子级用，不改动 frame 本身（否则会泄漏给兄弟节点）。
+			var childFrameForSubtree = frame;
+			if (go.GetComponent(Mask) != null)
+				childFrameForSubtree = withClip(frame, intersectClip(frame.clip, toScreenRect(frame)));
+			walk(go, childFrameForSubtree, forceDirty);
+		}
+	}
+
+	/** 复制一份布局帧并替换裁剪矩形。 */
+	private function withClip(frame:LayoutFrame, clip:unity.Rect):LayoutFrame {
+		return {
+			canvasScale: frame.canvasScale,
+			ownScale: frame.ownScale,
+			scale: frame.scale,
+			origin: frame.origin,
+			local: frame.local,
+			clip: clip
+		};
+	}
+
+	/** 按 Unity 的 anchor/pivot/offset 规则把子 RectTransform 解析成屏幕帧。 */
+	private function applyAspectRatio(frame:LayoutFrame, fitter:AspectRatioFitter):LayoutFrame {
+		if (fitter == null || fitter.aspectRatio <= 0 || fitter.aspectMode == AspectMode.None)
+			return frame;
+		var width = frame.local.width;
+		var height = frame.local.height;
+		if (width <= 0 || height <= 0)
+			return frame;
+		var targetWidth = width;
+		var targetHeight = height;
+		switch (fitter.aspectMode) {
+			case AspectMode.WidthControlsHeight:
+				targetHeight = width / fitter.aspectRatio;
+			case AspectMode.HeightControlsWidth:
+				targetWidth = height * fitter.aspectRatio;
+			case AspectMode.FitInParent, AspectMode.EnvelopeParent:
+				var fittedHeight = width / fitter.aspectRatio;
+				if ((fitter.aspectMode == AspectMode.FitInParent && fittedHeight <= height)
+					|| (fitter.aspectMode == AspectMode.EnvelopeParent && fittedHeight >= height))
+					targetHeight = fittedHeight;
+				else
+					targetWidth = height * fitter.aspectRatio;
+			case AspectMode.None:
+				return frame;
+		}
+		var centerX = frame.local.x + width * 0.5;
+		var centerY = frame.local.y + height * 0.5;
+		var local = new unity.Rect(centerX - targetWidth * 0.5, centerY - targetHeight * 0.5, targetWidth, targetHeight);
+		return frameFor(frame.canvasScale, frame.ownScale, frame.origin, local, frame.clip, frame.scale);
+	}
+
+	private function childFrame(rt:RectTransform, parentFrame:LayoutFrame):LayoutFrame {
+		// 1) 在父级局部单位下解析子级矩形（原点在父级 pivot，与 Unity 一致）。
+		var p = parentFrame.local;
+		var aminX = p.x + rt.anchorMin.x * p.width;
+		var amaxX = p.x + rt.anchorMax.x * p.width;
+		var aminY = p.y + rt.anchorMin.y * p.height;
+		var amaxY = p.y + rt.anchorMax.y * p.height;
+		var sizeX = (amaxX - aminX) + rt.sizeDelta.x;
+		var sizeY = (amaxY - aminY) + rt.sizeDelta.y;
+		var refX = aminX + (amaxX - aminX) * rt.pivot.x;
+		var refY = aminY + (amaxY - aminY) * rt.pivot.y;
+		var pivotLocalX = refX + rt.anchoredPosition.x;
+		var pivotLocalY = refY + rt.anchoredPosition.y;
+
+		// 2) 父级局部单位 → 屏幕像素：先乘父级的 ownScale（父级的 localScale），再乘父级的 scale。
+		var toScreen = parentFrame.canvasScale * parentFrame.ownScale;
+		// 父级 pivot 在屏幕上的位置 + (子 pivot 相对父 pivot 的偏移) * toScreen
+		var originX = parentFrame.origin.x + pivotLocalX * toScreen;
+		var originY = parentFrame.origin.y - pivotLocalY * toScreen;
+
+		// 3) 子级自身局部单位 → 屏幕像素
+		var scale = toScreen * rt.localScale.x;
+		// PORT-NOTE: 缩放取 x 分量（工程里的 RectTransform 缩放都是等比；PanZoomController 例外，
+		// 它在缩放时同时改 x/y，这里取 x 已足够）。
+		var local = new unity.Rect(-rt.pivot.x * sizeX, -rt.pivot.y * sizeY, sizeX, sizeY);
+		return frameFor(scale, rt.localScale.x, new Vector2(originX, originY), local, parentFrame.clip, scale);
+	}
+
+	/** 把节点局部矩形（原点在 pivot）换算成屏幕左上角矩形。 */
+	private function toScreenRect(frame:LayoutFrame):unity.Rect {
+		var w = frame.local.width * frame.scale;
+		var h = frame.local.height * frame.scale;
+		var x = frame.origin.x + frame.local.x * frame.scale;
+		var y = frame.origin.y - frame.local.y * frame.scale - h;
+		return new unity.Rect(x, y, w, h);
+	}
+
+	// #endregion
+
+	// #region 渲染项
+
+	/** 为一个 GameObject 生成/更新渲染项。 */
+	private function renderNode(go:GameObject, frame:LayoutFrame, forceDirty:Bool):Void {
+		if (go == null || go.destroyed || !go.activeInHierarchy)
+			return;
+		if (isInstanceOf(go.transform, RectTransform))
+			framesByNode.set(go, frame);
+		// PORT-NOTE: 先清掉上一帧留下的「绘制矩形」，由下面真正生成渲染项的分支重新写。
+		// 不清会残留旧值，节点改小/移走后命中区仍是旧的。
+		renderedRectsByNode.remove(go);
+		registerHitCandidate(go);
+		var graphic:Graphic = null;
+		var text:TextMeshProUGUI = null;
+		var uiText:unity.ui.Text = null;
+		var renderer:SpriteRenderer = null;
+		for (c in go.GetAllComponents()) {
+			// PORT-NOTE: **「白色占位块」的根因就在这个名字遮蔽上**。
+			//
+			// 本模块底部声明过 `enum abstract UiEntryKind`，其成员曾叫 `Image` / `Text` /
+			// `Solid` / `SpriteRenderer`。Haxe 的模块作用域会把这些成员提升成**模块级名字**，
+			// 于是它们遮蔽了同名的类 `unity.ui.Image` / `unity.ui.Text` / `unity.SpriteRenderer`：
+			// `Std.isOfType(c, Text)` 实际是拿**整数 3** 去比较，判定恒为 false ——
+			// 18 个 `unity.ui.Image` 一个都进不了取帧分支，全部退化成 1×1 白图拉伸。
+			//
+			// 修法：枚举成员改名（`ImageGraphic` / `Label` / `SolidRect` / `WorldSprite`），
+			// 从根上消除遮蔽；这里保留全限定名作为二次保险（对**值位置**的遮蔽同样有效）。
+			if (graphic == null && isInstanceOf(c, Graphic))
+				graphic = cast c;
+			if (text == null && isInstanceOf(c, TextMeshProUGUI))
+				text = cast c;
+			if (uiText == null && isInstanceOf(c, unity.ui.Text))
+				uiText = cast c;
+			if (renderer == null && isInstanceOf(c, SpriteRenderer))
+				renderer = cast c;
+		}
+
+		// 裁剪：Mask / RectMask2D 会影响它**下面**的子树，本节点自身不受影响。
+		var clip = frame.clip;
+
+		if (graphic != null) {
+			graphicCount++;
+			var cls = Type.getClassName(Type.getClass(graphic));
+			graphicClassCounts.set(cls, (graphicClassCounts.exists(cls) ? graphicClassCounts.get(cls) : 0) + 1);
+			var rt = isInstanceOf(go.transform, RectTransform) ? cast(go.transform, RectTransform) : null;
+			if (rt != null) rectGraphicCount++;
+			if (rt == null) {
+				// PORT-NOTE: uGUI 的 Graphic 必须挂在 RectTransform 上；挂在普通 Transform 上
+				// 说明是手工对象图没换 Transform（见 MainGameScene.childRect 的说明），跳过并计数。
+				skippedCount++;
+				if (nonRectGraphicSamples.length < 12)
+					nonRectGraphicSamples.push('${nodePath(go)} [${Type.getClassName(Type.getClass(graphic))} tr=${Type.getClassName(Type.getClass(go.transform))}]');
+			} else {
+				var rect = toScreenRect(frame);
+				var entry = obtain(go);
+				updateGraphic(entry, go, graphic, text, uiText, rect, frame, alphaOf(go), frame.clip);
+			}
+			// PORT-NOTE: Mask 的裁剪由 walk() 派生子级帧时处理（只影响子树，不影响本节点）。
+		} else if (renderer != null && renderer.renderSprite != null) {
+			// PORT-NOTE: 世界空间的 SpriteRenderer（Mainmenu/Titlescreen 的背景就是这一类）。
+			// 它本来由精灵工作包的 `SpriteFrameFactory` 接线到 `renderSprite`，但**没有**任何
+			// 显示列表的所有者；这里按正交相机（orthographicSize / 世界坐标）把它换算到屏幕，
+			// 否则主菜单背景永远不可见。属跨包协作点，已在报告里标注。
+			spriteRendererCount++;
+			var entry = obtain(go);
+			updateSpriteRenderer(entry, renderer, alphaOf(go));
+		} else {
+			skippedCount++;
+		}
+	}
+
+	private function alphaOf(go:GameObject):Float {
+		// PORT-NOTE: CanvasGroup.alpha 在 Unity 里按层级相乘；这里向上收集并相乘。
+		var alpha = 1.0;
+		var tr:Transform = go.transform;
+		while (tr != null) {
+			if (tr.gameObject != null) {
+				var group = tr.gameObject.GetComponent(CanvasGroup);
+				if (group != null)
+					alpha *= group.alpha;
+			}
+			tr = tr.parent;
+		}
+		return alpha;
+	}
+
+	private function obtain(go:GameObject):UiEntry {
+		var entry = entries.get(go);
+		if (entry == null) {
+			entry = {
+				gameObject: go,
+				sprite: new FlxSprite(),
+				kind: UiEntryKind.Empty,
+				lastRevision: -1,
+				lastText: null,
+				lastRect: new unity.Rect(-1, -1, -1, -1),
+				worldSprite: null,
+				lastFontSize: -1,
+				lastFont: null,
+				retired: false,
+				lastSeenFrame: frame,
+				worldRenderer: null
+			};
+			entry.sprite.visible = false;
+			entries.set(go, entry);
+		}
+		// PORT-NOTE: 本帧重新出现（重新激活 / 复用）时从"墓碑"状态恢复。
+		if (entry.retired) {
+			entry.retired = false;
+			entry.lastRevision = -1;
+			entry.lastText = null;
+			entry.lastFontSize = -1;
+			entry.lastFont = null;
+		}
+		entry.lastSeenFrame = frame;
+		if (live.indexOf(entry) < 0)
+			live.push(entry);
+		return entry;
+	}
+
+	// #endregion
+
+	// #region Graphic → FlxSprite / FlxText
+
+	private function updateGraphic(entry:UiEntry, go:GameObject, graphic:Graphic, text:TextMeshProUGUI, uiText:Text,
+			rect:unity.Rect, frame:LayoutFrame, groupAlpha:Float, clip:unity.Rect):Void {
+		updateGraphicCalls++;
+		if (updateGraphicSamples.length < 8) {
+			updateGraphicSamples.push('${nodePath(go)} g=${Type.getClassName(Type.getClass(graphic))}'
+				+ ' text=${text != null} uiText=${uiText != null}');
+		}
+		entry.worldRenderer = null;
+		var color = graphic.color;
+		if (color == null)
+			color = new unity.Color(1, 1, 1, 1);
+		var alpha = color.a * groupAlpha;
+		var tint = FlxColor.fromRGBFloat(color.r, color.g, color.b, 1);
+
+		if (text != null) {
+			updateText(entry, text.text, text.fontSize, tint, alpha, text.alignment, text.enableWordWrapping,
+				text.richText, rect, text.enabled);
+			return;
+		}
+		if (uiText != null) {
+			var wrap = uiText.horizontalOverflow == unity.HorizontalWrapMode.Wrap;
+			updateText(entry, uiText.text, uiText.fontSize, tint, alpha, uiText.alignment, wrap,
+				uiText.supportRichText, rect, uiText.enabled);
+			return;
+		}
+
+		// ---- Image / RawImage ----
+		var sprite:unity.Sprite = null;
+		// PORT-NOTE: 这里刻意**不用** `Std.isOfType(graphic, Image)`：hxcpp 把带类型参数的
+		// `Std.isOfType(x, ClassOf<T>)` 优化成 `isOfType(x, <类索引常量>)`（本例生成
+		// `::Std_obj::isOfType(graphic,1)`），该常量在**同一模块有多个类**时可能取错索引，
+		// 实测恒为 false —— 于是 18 个 `unity.ui.Image` 一个都进不了这个分支，
+		// `imageWithSprite` / `imageWithoutSprite` 双双为 0，所有 Image 都退化成 1×1 白图拉伸
+		//（即「白色占位块」）。改用 `Type.getClass` 沿继承链判定的 `isInstanceOf`，语义明确。
+		var image = isInstanceOf(graphic, unity.ui.Image) ? cast(graphic, unity.ui.Image) : null;
+		var rawImage = isInstanceOf(graphic, unity.ui.RawImage) ? cast(graphic, unity.ui.RawImage) : null;
+		if (image != null)
+			sprite = image.activeSprite;
+		else if (rawImage != null && isInstanceOf(rawImage.texture, unity.Texture2D))
+			sprite = SpriteManifestLoader.createSpriteForTexture(cast rawImage.texture);
+
+		// PORT-NOTE: 诊断计数 —— 「白块」现象（Image 退化成 1x1 白图拉伸）只有区分
+		// 「sprite 没注入」和「sprite 有但取不到帧」才能定位。两者都记样例节点名。
+		if (image != null) {
+			if (sprite == null) {
+				imageWithoutSprite++;
+				if (imageWithoutSpriteSamples.length < 12)
+					imageWithoutSpriteSamples.push(nodePath(go));
+			} else {
+				imageWithSprite++;
+			}
+		}
+
+		var needsRebuild = entry.lastRevision != Graphic.revision || entry.kind != UiEntryKind.ImageGraphic;
+		if (sprite != null) {
+			var frame2 = SpriteFrameFactory.getFrame(sprite);
+			if (frame2 != null) {
+				if (needsRebuild || entry.worldSprite != sprite) {
+					entry.sprite.frames = SpriteFrameFactory.makeImageFrame(frame2);
+					entry.sprite.frame = frame2;
+					entry.kind = UiEntryKind.ImageGraphic;
+					entry.lastRevision = Graphic.revision;
+					entry.worldSprite = sprite;
+					entry.sprite.origin.set(0, 0);
+				}
+				solidCount++;
+			} else {
+				imageFrameFailed++;
+				if (imageFrameFailedSamples.length < 12)
+					imageFrameFailedSamples.push('${nodePath(go)} sprite=${spriteName(sprite)}');
+				applySolid(entry, tint, needsRebuild);
+			}
+		} else {
+			applySolid(entry, tint, needsRebuild);
+		}
+
+		var s = entry.sprite;
+		s.visible = graphic.enabled && alpha > 0.001;
+		s.alpha = alpha;
+		s.color = tint;
+		s.clipRect = clipToFlx(clip);
+		if (entry.kind == UiEntryKind.SolidRect) {
+			// 纯色块：1x1 白图拉伸到矩形（与 Unity 的 Image 无 sprite 时画纯色矩形一致）。
+			s.origin.set(0, 0);
+			s.setPosition(rect.x, rect.y);
+			s.setGraphicSize(Std.int(Math.max(1, rect.width)), Std.int(Math.max(1, rect.height)));
+		} else {
+			s.origin.set(0, 0);
+			s.setPosition(rect.x, rect.y);
+			if (s.frameWidth > 0 && s.frameHeight > 0)
+				s.setGraphicSize(Std.int(Math.max(1, rect.width)), Std.int(Math.max(1, rect.height)));
+		}
+		// PORT-NOTE: 记下**真正画出来**的矩形（见 renderedRectsByNode 的说明）。
+		// 用 `frameWidth/Height * scale` 而不是传入的 `rect`：纯色兜底分支与「有 sprite」
+		// 分支的尺寸来源不同，只有读 FlxSprite 自身几何才与画面严格一致。
+		renderedRectsByNode.set(go, flxSpriteRect(s));
+	}
+
+	/** FlxSprite 当前的屏幕矩形（左上角 + 帧尺寸 × 缩放）。 */
+	private static function flxSpriteRect(s:FlxSprite):unity.Rect {
+		if (s == null)
+			return null;
+		var w = (s.frameWidth > 0 ? s.frameWidth : s.width) * Math.abs(s.scale.x);
+		var h = (s.frameHeight > 0 ? s.frameHeight : s.height) * Math.abs(s.scale.y);
+		// PORT-NOTE: origin 非零时 FlxSprite 的 (x,y) 是**原点**位置，左上角要减去 origin。
+		// 本文件的 Graphic 分支统一把 origin 设成 (0,0)，但世界精灵分支会带上精灵 pivot，
+		// 因此这里按统一公式换算，两种来源都对。
+		return new unity.Rect(s.x - s.origin.x * Math.abs(s.scale.x), s.y - s.origin.y * Math.abs(s.scale.y), w, h);
+	}
+
+	/** 无贴图的 Graphic（Unity 里用 s_WhiteTexture 画纯色矩形）→ 拉伸的 1x1 白图。 */
+	private function applySolid(entry:UiEntry, tint:FlxColor, needsRebuild:Bool):Void {
+		if (needsRebuild || entry.kind != UiEntryKind.SolidRect) {
+			// PORT-NOTE: 共享同一张 1x1 白图（Key 固定 + unique=false），染色靠 FlxSprite.color，
+			// 因此几十个纯色块只占一张位图。
+			entry.sprite.makeGraphic(1, 1, FlxColor.WHITE, false, WHITE_KEY);
+			entry.kind = UiEntryKind.SolidRect;
+			entry.lastRevision = Graphic.revision;
+			entry.worldSprite = null;
+		}
+		entry.sprite.color = tint;
+	}
+
+	/** 文本（uGUI Text / TMPro TextMeshProUGUI）→ FlxText。 */
+	private function updateText(entry:UiEntry, value:String, size:Float, tint:FlxColor, alpha:Float,
+			alignment:Dynamic, wrap:Bool, richText:Bool, rect:unity.Rect, enabled:Bool):Void {
+		var label:FlxText = null;
+		if (entry.kind == UiEntryKind.Label && isInstanceOf(entry.sprite, FlxText))
+			label = cast entry.sprite;
+		if (label == null) {
+			// PORT-NOTE: 换类型时把旧的 FlxSprite 换成 FlxText。`entry.sprite` 的位置由
+			// `applyOrder()` 统一重排，所以这里直接替换引用即可，不必动 FlxGroup 的成员表。
+			var old = entry.sprite;
+			label = new FlxText(0, 0, 0, "");
+			label.origin.set(0, 0);
+			entry.sprite = label;
+			entry.kind = UiEntryKind.Label;
+			entry.lastText = null;
+			entry.lastFontSize = -1;
+			entry.lastFont = null;
+			textCount++;
+			// PORT-NOTE: 旧的 FlxSprite 若已被 FlxGroup 持有，它现在已不在 members 里
+			//（applyOrder 会用新引用覆写），销毁它。
+			old.destroy();
+		}
+		var text = value != null ? value : "";
+		if (entry.lastText != text) {
+			label.text = text;
+			entry.lastText = text;
+		}
+		var fontSize = Std.int(Math.max(1, Math.round(size)));
+		var font = resolveFont(text);
+		// PORT-NOTE: setFormat() 每次都会重建 TextField 的 defaultTextFormat 并重排版，
+		// 只在字体或字号真的变了时才调用（每帧调会明显掉帧）。
+		if (entry.lastFontSize != fontSize || entry.lastFont != font) {
+			label.setFormat(font, fontSize, tint, flixelAlignment(alignment), FlxTextBorderStyle.NONE);
+			entry.lastFontSize = fontSize;
+			entry.lastFont = font;
+		}
+		label.color = tint;
+		label.alpha = alpha;
+		label.wordWrap = wrap;
+		label.alignment = flixelAlignment(alignment);
+		label.fieldWidth = Math.max(1, rect.width);
+		label.origin.set(0, 0);
+		label.setPosition(rect.x, rect.y);
+		label.visible = enabled && alpha > 0.001 && text.length > 0;
+		// PORT-NOTE: 文本节点也要登记命中矩形（uGUI 的 Text 带 raycastTarget 时可被射线命中）。
+		// 这里用**布局矩形**而不是 FlxText 自身几何：文本的可见宽度随字数变化，
+		// 而 Unity 的点击区是 RectTransform 的矩形（与文字长度无关）。
+		if (entry.gameObject != null)
+			renderedRectsByNode.set(entry.gameObject, rect);
+	}
+
+	/** 世界空间 SpriteRenderer → 屏幕（正交相机换算）。 */
+	private function updateSpriteRenderer(entry:UiEntry, renderer:SpriteRenderer, groupAlpha:Float):Void {
+		var target = renderer.renderSprite;
+		if (target == null)
+			return;
+		// PORT-NOTE: 精灵工作包的 `renderSprite` 是**独立**的 FlxSprite；这里不能把它当本组
+		// 成员重复添加（同一个 FlxSprite 属于两个组时 flixel 的绘制/相机解析会互相干扰），
+		// 因此复制它的帧到本组的 sprite 上。
+		var tr:Transform = renderer.transform;
+		var pos = tr != null ? tr.position : new Vector3(0, 0, 0);
+		var scale = orthographicPixelsPerUnit();
+		var origin = cameraOrigin();
+		var x = FlxG.width * 0.5 + (pos.x - origin.x) * scale;
+		var y = FlxG.height * 0.5 - (pos.y - origin.y) * scale;
+		// 精灵原点（Unity 的 sprite.pivot）→ 屏幕左上角
+		var w = target.frameWidth * (target.scale.x == 0 ? 1 : target.scale.x);
+		var h = target.frameHeight * (target.scale.y == 0 ? 1 : target.scale.y);
+		if (w <= 0) w = target.width;
+		if (h <= 0) h = target.height;
+		var left = x - target.origin.x * (target.scale.x == 0 ? 1 : target.scale.x);
+		var top = y - (h - target.origin.y * (target.scale.y == 0 ? 1 : target.scale.y));
+
+		entry.worldRenderer = renderer;
+		if (entry.kind != UiEntryKind.WorldSprite || entry.worldSprite != target.frames) {
+			entry.sprite.frames = target.frames;
+			if (target.frame != null)
+				entry.sprite.frame = target.frame;
+			entry.kind = UiEntryKind.WorldSprite;
+			entry.worldSprite = target.frames;
+		}
+		entry.sprite.origin.set(target.origin.x, target.origin.y);
+		entry.sprite.scale.set(target.scale.x, target.scale.y);
+		// PORT-NOTE: 旋转来自 `RenderBridge.syncOne`（每帧按 `transform.eulerAngles.z` 写）。
+		// `renderSprite` 是这条链路的数据源，这里只跟随，避免两个写入者互相覆盖。
+		entry.sprite.angle = target.angle;
+		entry.sprite.flipX = target.flipX;
+		entry.sprite.flipY = target.flipY;
+		entry.sprite.color = target.color;
+		entry.sprite.alpha = target.alpha * groupAlpha * renderer.alpha;
+		entry.sprite.visible = renderer.enabled && target.visible;
+		entry.sprite.setPosition(left, top);
+		// PORT-NOTE: 世界精灵也要登记绘制矩形 —— 主菜单按钮、地图按钮的**可见内容**就是这一层，
+		// 而它们的可点击节点自身没有 RectTransform（见 renderedRectsByNode 的说明）。
+		if (renderer.gameObject != null)
+			renderedRectsByNode.set(renderer.gameObject, flxSpriteRect(entry.sprite));
+	}
+
+	/** 正交相机的"每世界单位多少屏幕像素"。 */
+	private function orthographicPixelsPerUnit():Float {
+		var cam = resolveCamera();
+		if (cam == null || cam.orthographicSize <= 0)
+			return 1;
+		return FlxG.height / (cam.orthographicSize * 2);
+	}
+
+	private function cameraOrigin():Vector3 {
+		var cam = resolveCamera();
+		if (cam == null || cam.transform == null)
+			return new Vector3(0, 0, 0);
+		return cam.transform.position;
+	}
+
+	/**
+	 * 场景里的主相机。
+	 *
+	 * PORT-NOTE: `unity.Camera.main` 在 shim 里是**惰性自建**的（不看 tag，也不看场景），
+	 * 直接用它拿不到 prefab 里那个 `orthographicSize = 3` 的相机（`Main.json` 节点 267）。
+	 * 这里优先在已登记的 uGUI 根里找第一个启用的 Camera 组件，找不到才回退到 `Camera.main`。
+	 */
+	private function resolveCamera():unity.Camera {
+		if (cachedCamera != null && !cachedCamera.destroyed && cachedCamera.enabled)
+			return cachedCamera;
+		for (root in roots) {
+			var cam = findCamera(root);
+			if (cam != null) {
+				cachedCamera = cam;
+				return cam;
+			}
+		}
+		cachedCamera = unity.Camera.main;
+		return cachedCamera;
+	}
+	private var cachedCamera:unity.Camera = null;
+
+	private function findCamera(go:GameObject):unity.Camera {
+		if (go == null)
+			return null;
+		var cam = go.GetComponent(unity.Camera);
+		if (cam != null && cam.enabled)
+			return cam;
+		for (child in go.transform.children) {
+			if (child == null || child.gameObject == null)
+				continue;
+			if (!child.gameObject.active)
+				continue;
+			cam = findCamera(child.gameObject);
+			if (cam != null)
+				return cam;
+		}
+		return null;
+	}
+
+	// #endregion
+
+	// #region CanvasScaler 换算
+
+	/**
+	 * `CanvasScaler` → 缩放系数（Unity `CanvasScaler.HandleScaleWithScreenSize` 的等价实现）。
+	 *
+	 * PORT-NOTE: 本工程的既有约定是「`Main` 场景逻辑分辨率 1280x720」（`source/Main.hx:15~16`），
+	 * 而各 prefab 的 CanvasScaler 用 `referenceResolution = (800, 600)` +
+	 * `ScaleWithScreenSize`；Unity 用屏幕分辨率算 scaleFactor，因此这里以 `FlxG.width/height`
+	 * （即窗口的 1280x720 逻辑分辨率）为屏幕尺寸，得到 GlobalUICanvas 的 1.6（matchWidthOrHeight=0）
+	 * 与 MainGame Canvas 的 1.2（matchWidthOrHeight=1）。
+	 * `ScreenMatchMode`：MatchWidthOrHeight 用几何插值；Expand 取较小比例；Shrink 取较大比例。
+	 */
+	public static function computeScaleFactor(scaler:CanvasScaler):Float {
+		if (scaler == null)
+			return 1;
+		if (scaler.uiScaleMode == ScaleMode.ConstantPixelSize)
+			return scaler.scaleFactor != 0 ? scaler.scaleFactor : 1;
+		if (scaler.uiScaleMode == ScaleMode.ConstantPhysicalSize)
+			// TODO-PORT: 物理尺寸模式（DPI 换算）在移植层没有 DPI 来源，退化为 1。
+			return 1;
+		var ref = scaler.referenceResolution;
+		if (ref == null || ref.x <= 0 || ref.y <= 0)
+			return 1;
+		var logWidth = Math.log(FlxG.width / ref.x) / Math.log(2);
+		var logHeight = Math.log(FlxG.height / ref.y) / Math.log(2);
+		return switch (scaler.screenMatchMode) {
+			case Expand:
+				Math.min(FlxG.width / ref.x, FlxG.height / ref.y);
+			case Shrink:
+				Math.max(FlxG.width / ref.x, FlxG.height / ref.y);
+			default:
+				// Unity: scaleFactor = Mathf.Pow(2, Mathf.Lerp(logWidth, logHeight, matchWidthOrHeight))
+				Math.pow(2, logWidth + (logHeight - logWidth) * scaler.matchWidthOrHeight);
+		}
+	}
+
+	// #endregion
+
+	// #region 小工具
+
+	private function flixelAlignment(alignment:Dynamic):flixel.text.FlxText.FlxTextAlign {
+		// PORT-NOTE: TextAnchor 与 TMPro.TextAlignmentOptions 的取值不同（前者 0..8，
+		// 后者是 256/512/… 的位标志），因此按各自规则换算到 Flixel 的 left/center/right。
+		if (alignment == null)
+			return flixel.text.FlxText.FlxTextAlign.LEFT;
+		var v:Int = cast alignment;
+		if (v <= 8) {
+			// unity.TextAnchor
+			return switch (v) {
+				case 1, 4, 7: flixel.text.FlxText.FlxTextAlign.CENTER;
+				case 2, 5, 8: flixel.text.FlxText.FlxTextAlign.RIGHT;
+				default: flixel.text.FlxText.FlxTextAlign.LEFT;
+			}
+		}
+		// TMPro.TextAlignmentOptions：低 8 位是水平对齐（Left=1/Center=2/Right=4/…）
+		var h = v & 0xFF;
+		if (h == 2 || h == 8 || h == 32)
+			return flixel.text.FlxText.FlxTextAlign.CENTER;
+		if (h == 4 || h == 16)
+			return flixel.text.FlxText.FlxTextAlign.RIGHT;
+		return flixel.text.FlxText.FlxTextAlign.LEFT;
+	}
+
+	/**
+	 * 文本用的字体资源 id。
+	 *
+	 * PORT-NOTE: TMP 的 `font`（TMP_FontAsset）在移植层没有解析来源（prefab 里是
+	 * `Fonts/mojangles/minecraft_font.asset`，`ResourceManifest` 按 ScriptableObject 返回原始字节），
+	 * 因此这里按**文本内容**挑字体：含非 ASCII（中文/日文等）用 unifont（覆盖 BMP），
+	 * 否则用 minecraft_font（像素字体，与原版观感一致）。两个 .otf 都已由 Project.xml 的
+	 * `<assets path="assets"/>` 打进可执行文件（lime 资源库，id 见下方候选表）。
+	 * TODO-PORT: 等 TMP 字体资产转换落地后，改为按 `TextMeshProUGUI.font` 的 guid 解析。
+	 */
+	private function resolveFont(text:String):String {
+		var cjk = false;
+		if (text != null) {
+			for (i in 0...text.length) {
+				if (text.charCodeAt(i) > 0x7F) {
+					cjk = true;
+					break;
+				}
+			}
+		}
+		var candidates = cjk
+			? ["assets/Fonts/unifont.otf", "Fonts/unifont.otf"]
+			: ["assets/Fonts/mojangles/minecraft_font.otf", "Fonts/mojangles/minecraft_font.otf"];
+		for (id in candidates) {
+			try {
+				if (openfl.utils.Assets.exists(id, openfl.utils.AssetType.FONT))
+					return id;
+			} catch (e:Dynamic) {}
+		}
+		return null;
+	}
+
+	private function clipToFlx(clip:unity.Rect):flixel.math.FlxRect {
+		if (clip == null || clip.width <= 0 || clip.height <= 0)
+			return null;
+		return flixel.math.FlxRect.get(clip.x, clip.y, clip.width, clip.height);
+	}
+
+	/**
+	 * 沿继承链判断 `obj` 是否是 `cls`（或其子类）的实例。
+	 *
+	 * PORT-NOTE: 不用 `Std.isOfType(obj, cls)` 的原因见 `updateGraphic` 里 Image 分支的说明：
+	 * hxcpp 会把 `Std.isOfType(x, ClassOf<T>())` 优化成 `isOfType(x, <类索引常量>)`，
+	 * 该常量在**同一模块声明多个类**时会取错（实测 `unity.ui.Image` 判定恒为 false）。
+	 * `Type.getClass` + `Type.getSuperClass` 走的是类对象本身，与模块布局无关，语义明确。
+	 */
+	private static function isInstanceOf(obj:Dynamic, cls:Class<Dynamic>):Bool {
+		if (obj == null || cls == null)
+			return false;
+		var c = Type.getClass(obj);
+		var guard = 0;
+		while (c != null && guard++ < 32) {
+			if (c == cls)
+				return true;
+			c = Type.getSuperClass(c);
+		}
+		return false;
+	}
+
+	/** 节点的层级路径（诊断用，如 `MainGame/MainScene/UI/Dialogs/CustomDialog/Root/Background`）。 */
+	private function nodePath(go:GameObject):String {
+		if (go == null)
+			return "(null)";
+		var parts:Array<String> = [];
+		var tr:Transform = go.transform;
+		var guard = 0;
+		while (tr != null && guard++ < 32) {
+			parts.unshift(tr.gameObject != null ? tr.gameObject.name : "?");
+			tr = tr.parent;
+		}
+		return parts.join("/");
+	}
+
+	/** 精灵的可读描述（诊断用）。 */
+	private function spriteName(sprite:unity.Sprite):String {
+		if (sprite == null)
+			return "null";
+		var rect = sprite.rect;
+		return '${sprite.name}(rect=${rect.x},${rect.y},${rect.width},${rect.height}'
+			+ ' tex=${sprite.texture != null ? (sprite.texture.name != null ? sprite.texture.name : "?") : "null"})';
+	}
+
+	private function intersectClip(current:unity.Rect, next:unity.Rect):unity.Rect {
+		if (current == null)
+			return next;
+		var x = Math.max(current.x, next.x);
+		var y = Math.max(current.y, next.y);
+		var x2 = Math.min(current.x + current.width, next.x + next.width);
+		var y2 = Math.min(current.y + current.height, next.y + next.height);
+		return new unity.Rect(x, y, Math.max(0, x2 - x), Math.max(0, y2 - y));
+	}
+
+	// #endregion
+}
+
+typedef HitCandidate = {
+	gameObject:GameObject,
+	handlers:Array<Dynamic>,
+	hasRectTransform:Bool,
+	rect:unity.Rect,
+	order:Int
+};
+
+typedef HitTarget = {
+	gameObject:GameObject,
+	handlers:Array<Dynamic>,
+	rect:unity.Rect,
+	order:Int,
+	isButton:Bool
+};
+
+typedef UiEntry = {
+	gameObject:GameObject,
+	sprite:FlxSprite,
+	kind:UiEntryKind,
+	lastRevision:Int,
+	lastText:String,
+	lastRect:unity.Rect,
+	/** 上次绑定过的资源对象（精灵/帧集合），用于判断是否需要重设 frames。 */
+	worldSprite:Dynamic,
+	/** 上次应用到 FlxText 的字号 / 字体资源 id（避免每帧重排版）。 */
+	lastFontSize:Int,
+	lastFont:String,
+	/** 本帧未出现在遍历结果里（未激活或已销毁）；重新出现时恢复。 */
+	retired:Bool,
+	/** 上次被遍历到的帧序号。 */
+	lastSeenFrame:Int,
+	/** 该项对应的 SpriteRenderer（非 null 时参与排序层排序）。 */
+	worldRenderer:SpriteRenderer
+};
+
+// PORT-NOTE: 枚举成员刻意**不叫** `Image` / `Text` / `Solid` / `SpriteRenderer`。
+// Haxe 的模块作用域会把它们提升为模块级名字，从而**遮蔽**同名的类
+//（`unity.ui.Image`、`unity.ui.Text`、`unity.SpriteRenderer`）——
+// `Std.isOfType(c, Text)` 于是变成拿整数比较，判定恒为 false。
+// 这正是「18 个 Image 全部退化成 1×1 白块」的根因（详见 renderNode 的 PORT-NOTE）。
+enum abstract UiEntryKind(Int) {
+	var Empty = 0;
+	var ImageGraphic = 1;
+	var SolidRect = 2;
+	var Label = 3;
+	var WorldSprite = 4;
+}
+
+/** 布局帧（见 UiRenderer.frameFor 的说明）。 */
+typedef LayoutFrame = {
+	canvasScale:Float,
+	ownScale:Float,
+	/** 该节点局部单位 → 屏幕像素的比例（canvasScale * 各级 ownScale）。 */
+	scale:Float,
+	origin:Vector2,
+	local:unity.Rect,
+	clip:unity.Rect
+};

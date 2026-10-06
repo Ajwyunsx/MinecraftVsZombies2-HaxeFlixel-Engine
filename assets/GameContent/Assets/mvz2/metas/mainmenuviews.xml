@@ -1,0 +1,38 @@
+<views>
+    <view id="default" priority="0" spritesheet="mvz2:mainmenu/view/default" />
+    <view id="halloween" priority="100" spritesheet="mvz2:mainmenu/view/halloween">
+        <conditions>
+            <condition required="mvz2:level.prologue" />
+        </conditions>
+    </view>
+    <view id="dream" priority="200" spritesheet="mvz2:mainmenu/view/dream">
+        <conditions>
+            <condition required="mvz2:entered_dream" requiredNot="mvz2:dream_is_nightmare" />
+        </conditions>
+    </view>
+    <view id="nightmare" priority="200" spritesheet="mvz2:mainmenu/view/nightmare">
+        <conditions>
+            <condition required="mvz2:entered_dream mvz2:dream_is_nightmare" />
+        </conditions>
+    </view>
+    <view id="castle" priority="300" spritesheet="mvz2:mainmenu/view/castle">
+        <conditions>
+            <condition required="mvz2:entered_castle" />
+        </conditions>
+    </view>
+    <view id="mausoleum" priority="400" spritesheet="mvz2:mainmenu/view/mausoleum">
+        <conditions>
+            <condition required="mvz2:entered_mausoleum" />
+        </conditions>
+    </view>
+    <view id="ship" priority="500" spritesheet="mvz2:mainmenu/view/ship">
+        <conditions>
+            <condition required="mvz2:entered_ship" />
+        </conditions>
+    </view>
+    <view id="palace" priority="600" spritesheet="mvz2:mainmenu/view/palace">
+        <conditions>
+            <condition required="mvz2:entered_palace" />
+        </conditions>
+    </view>
+</views>

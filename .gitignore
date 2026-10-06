@@ -1,0 +1,38 @@
+# ===== Haxe/OpenFL 编译输出 =====
+export/
+**/export/
+
+# ===== Python 缓存 =====
+__pycache__/
+*.py[cod]
+
+# ===== 日志 =====
+*.log
+
+# ===== hxshadow 影子拷贝（shadowloop.py 生成）=====
+/hxshadow/mvz2/
+/hxshadow/mvz2logic/
+/hxshadow/unity/
+
+# ===== 探测 / 截图 / 日志产物 =====
+/tools_build/probe_tmp/
+/tools_build/shots/
+/tools_build/final_logs/
+
+# ===== 验证工程临时目录 =====
+/verify/tmp/
+/verify/tmpimport/
+/verify/tmpimport2/
+/verify/tmpimport3/
+/verify/tmpimport4/
+/verify/tmpsave/
+
+# ===== 工具生成的中间文件 =====
+/tools_build/_apply.json
+/tools_build/named_arg_scan.json
+/tools_build/_fields.txt
+/tools_build/_fields_all.txt
+/hxshadow/ctorargs.txt
+/hxshadow/imps.txt
+/hxshadow/myerrors.txt
+/hxshadow/noctor.txt
